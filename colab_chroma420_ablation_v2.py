@@ -11,6 +11,8 @@ import sys
 
 RESULTS_CSV = 'results/chroma420_bunny_ablation_v2.csv'
 OUT_DIR = 'output/chroma420_ablation_v2'
+FOLLOWUP_OUT_DIR = '/content/drive/MyDrive/ChromaNeRV_runs/output/chroma420_ywidth_followup'
+FOLLOWUP_RESULTS_CSV = '/content/drive/MyDrive/ChromaNeRV_runs/results/chroma420_ywidth_followup.csv'
 
 
 def common_args():
@@ -118,6 +120,23 @@ def y_width_sweep(best_lambda_c, best_lambda_rgb, widths=(96, 80, 64, 48)):
     return commands
 
 
+def rgb_asym_fair_comparison(widths=(32, 24, 16, 8)):
+    commands = []
+    for width in widths:
+        command = common_args()
+        command[command.index('--outf') + 1] = FOLLOWUP_OUT_DIR
+        command[command.index('--results_csv') + 1] = FOLLOWUP_RESULTS_CSV
+        command.extend([
+            '--experiment', 'rgb_asym',
+            '--rgb_branch_width', str(width),
+            '--ablation_group', 'rgb_asym_fair_comparison',
+            '--run_name', f'rgb_asym_w{width}',
+            '--eval_freq', '300',
+        ])
+        commands.append(command)
+    return commands
+
+
 def run_commands(commands):
     for command in commands:
         print(' '.join(command), flush=True)
@@ -137,6 +156,7 @@ def summarize(csv_path=RESULTS_CSV, baseline_run='posthoc420_from_rgb_nervs'):
         'chroma_upsampler',
         'learned_upsampler_width',
         'y_branch_width',
+        'rgb_branch_width',
         'params_M',
         'estimated_gflops',
         'model_fps',

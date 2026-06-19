@@ -6,13 +6,14 @@ import torch
 from model_chroma_nerv import (
     ChromaGenerator,
     LearnedChromaUpsampler,
+    RGBAsymGenerator,
     apply_posthoc_420_to_rgb,
     downsample_chroma,
     downsample_chroma_420,
     reconstruct_rgb_from_y_and_chroma,
     reconstruct_rgb_from_420,
 )
-from train_chroma_nerv import estimate_model_gflops, representation_sample_ratio
+from train_chroma_nerv import build_model, estimate_model_gflops, representation_sample_ratio
 
 
 def generator_kwargs():
@@ -40,6 +41,34 @@ def predict_args(experiment):
         chroma_upsampler='bilinear',
         chroma_downsample='area',
         chroma_upsample='bilinear',
+    )
+
+
+def trainer_args(experiment):
+    kwargs = generator_kwargs()
+    return SimpleNamespace(
+        experiment=experiment,
+        stem_dim_num=kwargs['stem_dim_num'],
+        fc_hw_dim=kwargs['fc_hw_dim'],
+        expansion=kwargs['expansion'],
+        num_blocks=kwargs['num_blocks'],
+        norm=kwargs['norm'],
+        act=kwargs['act'],
+        reduction=kwargs['reduction'],
+        conv_type=kwargs['conv_type'],
+        strides=kwargs['stride_list'],
+        single_res=kwargs['sin_res'],
+        lower_width=kwargs['lower_width'],
+        sigmoid=kwargs['sigmoid'],
+        chroma_scale=2,
+        chroma_downsample='area',
+        chroma_upsampler='bilinear',
+        learned_upsampler_width=16,
+        learned_upsampler_depth=2,
+        learned_upsampler_residual=False,
+        y_branch_width=2,
+        rgb_branch_width=2,
+        chroma_branch_width=2,
     )
 
 
@@ -77,6 +106,10 @@ class Chroma420UtilityTests(unittest.TestCase):
         )
         self.assertEqual(
             representation_sample_ratio(SimpleNamespace(experiment='rgb444', chroma_scale=2)),
+            1.0,
+        )
+        self.assertEqual(
+            representation_sample_ratio(SimpleNamespace(experiment='rgb_asym', chroma_scale=2)),
             1.0,
         )
 
@@ -154,6 +187,33 @@ class ChromaGeneratorTests(unittest.TestCase):
             estimate_model_gflops(narrow, embed_input, args),
             estimate_model_gflops(wide, embed_input, args),
         )
+
+    def test_rgb_asym_output_shape(self):
+        kwargs = generator_kwargs()
+        kwargs['rgb_branch_width'] = 2
+        model = RGBAsymGenerator(**kwargs)
+        output = model(torch.rand(1, 4))
+        self.assertEqual(output.shape, (1, 3, 8, 12))
+
+    def test_narrower_rgb_asym_branch_reduces_estimated_flops(self):
+        wide_kwargs = generator_kwargs()
+        wide_kwargs['rgb_branch_width'] = 4
+        narrow_kwargs = generator_kwargs()
+        narrow_kwargs['rgb_branch_width'] = 2
+        wide = RGBAsymGenerator(**wide_kwargs)
+        narrow = RGBAsymGenerator(**narrow_kwargs)
+        embed_input = torch.rand(1, 4)
+        args = predict_args('rgb_asym')
+        self.assertLess(
+            estimate_model_gflops(narrow, embed_input, args),
+            estimate_model_gflops(wide, embed_input, args),
+        )
+
+    def test_existing_experiments_still_instantiate(self):
+        for experiment in ['rgb444', 'posthoc420', 'neural420_shared', 'neural420_asym_y']:
+            with self.subTest(experiment=experiment):
+                model = build_model(trainer_args(experiment), embed_length=4)
+                self.assertIsNotNone(model)
 
 
 if __name__ == '__main__':

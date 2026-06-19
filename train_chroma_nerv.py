@@ -20,6 +20,7 @@ from torchvision.utils import save_image
 
 from model_chroma_nerv import (
     ChromaGenerator,
+    RGBAsymGenerator,
     apply_posthoc_420_to_rgb,
     downsample_chroma,
     reconstruct_rgb_from_y_and_chroma,
@@ -73,6 +74,7 @@ CSV_FIELDS = [
     'learned_upsampler_depth',
     'learned_upsampler_residual',
     'y_branch_width',
+    'rgb_branch_width',
     'chroma_branch_width',
     'visual_dir',
     'out_dir',
@@ -103,6 +105,7 @@ def parse_args():
             'neural420_shared_learned_up',
             'neural420_early_chroma',
             'neural420_asym_y',
+            'rgb_asym',
         ],
     )
     parser.add_argument(
@@ -127,6 +130,7 @@ def parse_args():
     parser.add_argument('--learned_upsampler_residual', action='store_true')
     parser.add_argument('--chroma_scale', type=int, default=2, choices=[2, 4])
     parser.add_argument('--y_branch_width', type=int, default=96)
+    parser.add_argument('--rgb_branch_width', type=int, default=96)
     parser.add_argument('--chroma_branch_width', type=int, default=96)
     parser.add_argument('--ablation_group', default='')
 
@@ -182,7 +186,7 @@ def parse_args():
 
 
 def resolve_args(args):
-    expected_space = {'rgb444': 'rgb', 'ycbcr444': 'ycbcr'}.get(args.experiment)
+    expected_space = {'rgb444': 'rgb', 'rgb_asym': 'rgb', 'ycbcr444': 'ycbcr'}.get(args.experiment)
     if expected_space is not None and args.color_space not in {None, expected_space}:
         raise ValueError(f'{args.experiment} requires --color_space {expected_space}')
     if args.experiment in EXPERIMENTS_NEURAL_420 and args.color_space not in {None, 'ycbcr'}:
@@ -231,12 +235,15 @@ def model_kwargs(args, embed_length):
         'learned_upsampler_depth': args.learned_upsampler_depth,
         'learned_upsampler_residual': args.learned_upsampler_residual,
         'y_branch_width': args.y_branch_width,
+        'rgb_branch_width': args.rgb_branch_width,
         'chroma_branch_width': args.chroma_branch_width,
     }
 
 
 def build_model(args, embed_length):
     kwargs = model_kwargs(args, embed_length)
+    if args.experiment == 'rgb_asym':
+        return RGBAsymGenerator(**kwargs)
     if args.experiment in EXPERIMENTS_NEURAL_420:
         return ChromaGenerator(args.experiment, **kwargs)
     return Generator(**kwargs)
@@ -274,6 +281,10 @@ def save_checkpoint(path, model, optimizer, epoch, best_rgb_psnr, args):
 
 
 def predict(model, embed_input, args):
+    if args.experiment == 'rgb_asym':
+        rgb = model(embed_input)
+        return {'rgb': rgb, 'ycbcr': rgb_to_ycbcr_bt709(rgb), 'cbcr_low': None}
+
     if args.experiment in EXPERIMENTS_NEURAL_420:
         output = model(embed_input)
         rgb = reconstruct_rgb_from_y_and_chroma(
@@ -302,6 +313,11 @@ def predict(model, embed_input, args):
 
 
 def compute_train_loss(model, embed_input, rgb_target, args):
+    if args.experiment == 'rgb_asym':
+        rgb_output = model(embed_input)
+        loss = loss_fn(rgb_output, rgb_target, args)
+        return loss, {'loss': loss.item()}
+
     if args.experiment in EXPERIMENTS_NEURAL_420:
         output = model(embed_input)
         ycbcr_target = rgb_to_ycbcr_bt709(rgb_target)
@@ -472,6 +488,7 @@ def append_csv(metrics, checkpoint_path, visual_dir, args):
         'learned_upsampler_depth': args.learned_upsampler_depth,
         'learned_upsampler_residual': args.learned_upsampler_residual,
         'y_branch_width': args.y_branch_width,
+        'rgb_branch_width': args.rgb_branch_width,
         'chroma_branch_width': args.chroma_branch_width,
         'visual_dir': visual_dir,
         'out_dir': args.out_dir,

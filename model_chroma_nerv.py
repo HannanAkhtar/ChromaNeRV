@@ -220,3 +220,48 @@ class ChromaGenerator(nn.Module):
         if cbcr_low.shape[-2:] != target_size:
             cbcr_low = resize_chroma(cbcr_low, target_size, self.chroma_resize_mode)
         return {'y': y, 'cbcr_low': cbcr_low}
+
+
+class RGBAsymGenerator(nn.Module):
+    """RGB baseline with the same narrow final branch used by asymmetric Y."""
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.sigmoid = kwargs['sigmoid']
+        stem_dim, stem_num = [int(x) for x in kwargs['stem_dim_num'].split('_')]
+        self.fc_h, self.fc_w, self.fc_dim = [int(x) for x in kwargs['fc_hw_dim'].split('_')]
+        mlp_dims = (
+            [kwargs['embed_length']]
+            + [stem_dim] * stem_num
+            + [self.fc_h * self.fc_w * self.fc_dim]
+        )
+        self.stem = MLP(dim_list=mlp_dims, act=kwargs['act'])
+
+        stride_list = kwargs['stride_list']
+        if not stride_list:
+            raise ValueError('stride_list must contain at least one upsampling stage')
+
+        self.shared_layers, ngf = ChromaGenerator._build_stages(
+            self.fc_dim, stride_list[:-1], 0, **kwargs)
+        rgb_branch_width = kwargs.get('rgb_branch_width', kwargs.get('y_branch_width', ngf))
+        self.rgb_adapter = (
+            nn.Identity()
+            if rgb_branch_width == ngf
+            else nn.Conv2d(ngf, rgb_branch_width, 1, 1, bias=kwargs['bias'])
+        )
+        self.rgb_layers, ngf = ChromaGenerator._build_fixed_width_stage(
+            rgb_branch_width, stride_list[-1], **kwargs)
+        self.rgb_head = nn.Conv2d(ngf, 3, 1, 1, bias=kwargs['bias'])
+
+    def _normalize(self, tensor):
+        return torch.sigmoid(tensor) if self.sigmoid else (torch.tanh(tensor) + 1) * 0.5
+
+    def forward(self, inputs):
+        features = self.stem(inputs)
+        features = features.view(features.size(0), self.fc_dim, self.fc_h, self.fc_w)
+        for layer in self.shared_layers:
+            features = layer(features)
+        features = self.rgb_adapter(features)
+        for layer in self.rgb_layers:
+            features = layer(features)
+        return self._normalize(self.rgb_head(features))
