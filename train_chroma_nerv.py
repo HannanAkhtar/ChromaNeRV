@@ -64,6 +64,18 @@ CSV_FIELDS = [
     'psnr_y',
     'psnr_cb',
     'psnr_cr',
+    'yuv_psnr_611_dbavg',
+    'yuv_psnr_611_mse',
+    'ssim_y',
+    'ssim_cb',
+    'ssim_cr',
+    'yuv_ssim_611',
+    'lpips_alex',
+    'frame_psnr_mean',
+    'frame_psnr_std',
+    'frame_y_psnr_mean',
+    'frame_y_psnr_std',
+    'temporal_rgb_error_diff',
     'output_sample_ratio',
     'lambda_y',
     'lambda_c',
@@ -415,9 +427,37 @@ def representation_sample_ratio(args):
     return (1 + 2 / chroma_scale ** 2) / 3
 
 
+def psnr_from_mse(mse):
+    return float('inf') if mse == 0 else -10 * np.log10(mse)
+
+
 def calculate_psnr(sum_squared_error, count):
     mse = sum_squared_error / count
-    return float('inf') if mse == 0 else -10 * np.log10(mse)
+    return psnr_from_mse(mse)
+
+
+def weighted_yuv_psnr_dbavg(psnr_y, psnr_cb, psnr_cr):
+    return (6 * psnr_y + psnr_cb + psnr_cr) / 8
+
+
+def weighted_yuv_psnr_mse(mse_y, mse_cb, mse_cr):
+    weighted_mse = (6 * mse_y + mse_cb + mse_cr) / 8
+    return psnr_from_mse(weighted_mse)
+
+
+def frame_psnr_values(error_tensor):
+    per_frame_mse = error_tensor.square().flatten(1).mean(dim=1).detach().cpu().numpy()
+    return [psnr_from_mse(float(mse)) for mse in per_frame_mse]
+
+
+def temporal_rgb_error_diff_from_errors(errors):
+    if len(errors) < 2:
+        return float('nan')
+    diffs = [
+        (cur - prev).abs().mean().item()
+        for prev, cur in zip(errors[:-1], errors[1:])
+    ]
+    return float(np.mean(diffs))
 
 
 def safe_ms_ssim(rgb_output, rgb_target):
@@ -426,6 +466,24 @@ def safe_ms_ssim(rgb_output, rgb_target):
     except AssertionError:
         # Small debug frames cannot pass through all MS-SSIM downsamplings.
         return ssim(rgb_output, rgb_target, data_range=1, size_average=True).item()
+
+
+def safe_ssim(channel_output, channel_target):
+    try:
+        return ssim(channel_output, channel_target, data_range=1, size_average=True).item()
+    except AssertionError:
+        return float('nan')
+
+
+def build_lpips_model(device):
+    try:
+        import lpips
+        model = lpips.LPIPS(net='alex').to(device)
+        model.eval()
+        return model
+    except Exception as exc:
+        print(f'LPIPS unavailable; writing NaN. Reason: {exc}')
+        return None
 
 
 def save_visuals(prediction, rgb_target, ycbcr_target, visual_dir, start_index, args):
@@ -478,6 +536,18 @@ def append_csv(metrics, checkpoint_path, visual_dir, args):
         'psnr_y': f"{metrics['psnr_y']:.4f}",
         'psnr_cb': f"{metrics['psnr_cb']:.4f}",
         'psnr_cr': f"{metrics['psnr_cr']:.4f}",
+        'yuv_psnr_611_dbavg': f"{metrics['yuv_psnr_611_dbavg']:.4f}",
+        'yuv_psnr_611_mse': f"{metrics['yuv_psnr_611_mse']:.4f}",
+        'ssim_y': f"{metrics['ssim_y']:.6f}",
+        'ssim_cb': f"{metrics['ssim_cb']:.6f}",
+        'ssim_cr': f"{metrics['ssim_cr']:.6f}",
+        'yuv_ssim_611': f"{metrics['yuv_ssim_611']:.6f}",
+        'lpips_alex': f"{metrics['lpips_alex']:.6f}",
+        'frame_psnr_mean': f"{metrics['frame_psnr_mean']:.4f}",
+        'frame_psnr_std': f"{metrics['frame_psnr_std']:.4f}",
+        'frame_y_psnr_mean': f"{metrics['frame_y_psnr_mean']:.4f}",
+        'frame_y_psnr_std': f"{metrics['frame_y_psnr_std']:.4f}",
+        'temporal_rgb_error_diff': f"{metrics['temporal_rgb_error_diff']:.6f}",
         'output_sample_ratio': f"{metrics['output_sample_ratio']:.4f}",
         'lambda_y': args.lambda_y,
         'lambda_c': args.lambda_c,
@@ -511,6 +581,14 @@ def format_metrics(metrics, checkpoint_path):
         f"PSNR-Y: {metrics['psnr_y']:.4f}\n"
         f"PSNR-Cb: {metrics['psnr_cb']:.4f}\n"
         f"PSNR-Cr: {metrics['psnr_cr']:.4f}\n"
+        f"YUV PSNR 6:1:1 dB avg: {metrics['yuv_psnr_611_dbavg']:.4f}\n"
+        f"YUV PSNR 6:1:1 MSE: {metrics['yuv_psnr_611_mse']:.4f}\n"
+        f"SSIM-Y/Cb/Cr: {metrics['ssim_y']:.6f}/{metrics['ssim_cb']:.6f}/{metrics['ssim_cr']:.6f}\n"
+        f"YUV SSIM 6:1:1: {metrics['yuv_ssim_611']:.6f}\n"
+        f"LPIPS Alex: {metrics['lpips_alex']:.6f}\n"
+        f"Frame RGB PSNR mean/std: {metrics['frame_psnr_mean']:.4f}/{metrics['frame_psnr_std']:.4f}\n"
+        f"Frame Y PSNR mean/std: {metrics['frame_y_psnr_mean']:.4f}/{metrics['frame_y_psnr_std']:.4f}\n"
+        f"Temporal RGB error diff: {metrics['temporal_rgb_error_diff']:.6f}\n"
         f"Params: {metrics['params_M']:.6f}M\n"
         f"Estimated GFLOPs: {metrics['estimated_gflops']:.4f}\n"
         f"Model FPS: {metrics['model_fps']:.4f}\n"
@@ -524,10 +602,16 @@ def evaluate(model, dataloader, positional_encoding, device, checkpoint_path, ep
     model.eval()
     sums = {'rgb': 0.0, 'y': 0.0, 'cb': 0.0, 'cr': 0.0}
     counts = {'rgb': 0, 'y': 0, 'cb': 0, 'cr': 0}
+    ssim_sums = {'y': 0.0, 'cb': 0.0, 'cr': 0.0}
     msssim_total = 0.0
+    lpips_total = 0.0
     frame_count = 0
+    frame_rgb_psnrs = []
+    frame_y_psnrs = []
+    rgb_errors_for_temporal = []
     benchmark_input = None
     visual_dir = os.path.join(args.out_dir, 'visuals')
+    lpips_model = build_lpips_model(device)
 
     for step, (rgb_target, norm_index) in enumerate(dataloader):
         if args.debug and step > 1:
@@ -545,7 +629,21 @@ def evaluate(model, dataloader, positional_encoding, device, checkpoint_path, ep
             channel_error = ycbcr_error[:, channel_index:channel_index + 1]
             sums[channel_name] += channel_error.square().sum().item()
             counts[channel_name] += channel_error.numel()
+            ssim_sums[channel_name] += safe_ssim(
+                prediction['ycbcr'][:, channel_index:channel_index + 1],
+                ycbcr_target[:, channel_index:channel_index + 1],
+            ) * rgb_target.size(0)
+        frame_rgb_psnrs.extend(frame_psnr_values(rgb_error))
+        frame_y_psnrs.extend(frame_psnr_values(ycbcr_error[:, 0:1]))
+        for batch_index in range(rgb_error.size(0)):
+            rgb_errors_for_temporal.append(rgb_error[batch_index].detach().cpu())
         msssim_total += safe_ms_ssim(prediction['rgb'], rgb_target) * rgb_target.size(0)
+        if lpips_model is not None:
+            pred_lpips = prediction['rgb'] * 2 - 1
+            target_lpips = rgb_target * 2 - 1
+            lpips_total += lpips_model(pred_lpips, target_lpips).mean().item() * rgb_target.size(0)
+        else:
+            lpips_total = float('nan')
         save_visuals(prediction, rgb_target, ycbcr_target, visual_dir, frame_count, args)
         frame_count += rgb_target.size(0)
         benchmark_input = embed_input if benchmark_input is None else benchmark_input
@@ -554,15 +652,36 @@ def evaluate(model, dataloader, positional_encoding, device, checkpoint_path, ep
         raise RuntimeError('Evaluation dataset is empty')
     model_fps, end_to_end_fps = benchmark_fps(model, benchmark_input, args, device)
     estimated_gflops = estimate_model_gflops(model, benchmark_input, args)
+    psnr_y = calculate_psnr(sums['y'], counts['y'])
+    psnr_cb = calculate_psnr(sums['cb'], counts['cb'])
+    psnr_cr = calculate_psnr(sums['cr'], counts['cr'])
+    mse_y = sums['y'] / counts['y']
+    mse_cb = sums['cb'] / counts['cb']
+    mse_cr = sums['cr'] / counts['cr']
+    ssim_y = ssim_sums['y'] / frame_count
+    ssim_cb = ssim_sums['cb'] / frame_count
+    ssim_cr = ssim_sums['cr'] / frame_count
     metrics = {
         'epoch': epoch,
         'experiment': args.experiment,
         'params_M': sum(parameter.numel() for parameter in model.parameters()) / 1e6,
         'rgb_psnr': calculate_psnr(sums['rgb'], counts['rgb']),
         'rgb_ms_ssim': msssim_total / frame_count,
-        'psnr_y': calculate_psnr(sums['y'], counts['y']),
-        'psnr_cb': calculate_psnr(sums['cb'], counts['cb']),
-        'psnr_cr': calculate_psnr(sums['cr'], counts['cr']),
+        'psnr_y': psnr_y,
+        'psnr_cb': psnr_cb,
+        'psnr_cr': psnr_cr,
+        'yuv_psnr_611_dbavg': weighted_yuv_psnr_dbavg(psnr_y, psnr_cb, psnr_cr),
+        'yuv_psnr_611_mse': weighted_yuv_psnr_mse(mse_y, mse_cb, mse_cr),
+        'ssim_y': ssim_y,
+        'ssim_cb': ssim_cb,
+        'ssim_cr': ssim_cr,
+        'yuv_ssim_611': (6 * ssim_y + ssim_cb + ssim_cr) / 8,
+        'lpips_alex': lpips_total / frame_count if lpips_model is not None else float('nan'),
+        'frame_psnr_mean': float(np.mean(frame_rgb_psnrs)),
+        'frame_psnr_std': float(np.std(frame_rgb_psnrs)),
+        'frame_y_psnr_mean': float(np.mean(frame_y_psnrs)),
+        'frame_y_psnr_std': float(np.std(frame_y_psnrs)),
+        'temporal_rgb_error_diff': temporal_rgb_error_diff_from_errors(rgb_errors_for_temporal),
         'model_fps': model_fps,
         'end_to_end_fps': end_to_end_fps,
         'estimated_gflops': estimated_gflops,

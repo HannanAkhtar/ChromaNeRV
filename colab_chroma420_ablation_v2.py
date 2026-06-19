@@ -166,6 +166,18 @@ def summarize(csv_path=RESULTS_CSV, baseline_run='posthoc420_from_rgb_nervs'):
         'psnr_y',
         'psnr_cb',
         'psnr_cr',
+        'yuv_psnr_611_dbavg',
+        'yuv_psnr_611_mse',
+        'ssim_y',
+        'ssim_cb',
+        'ssim_cr',
+        'yuv_ssim_611',
+        'lpips_alex',
+        'frame_psnr_mean',
+        'frame_psnr_std',
+        'frame_y_psnr_mean',
+        'frame_y_psnr_std',
+        'temporal_rgb_error_diff',
     ]
     dataframe = pd.read_csv(csv_path)
     summary = dataframe[columns].copy()

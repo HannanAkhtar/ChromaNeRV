@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from model_chroma_nerv import (
@@ -14,6 +15,8 @@ from model_chroma_nerv import (
     reconstruct_rgb_from_420,
 )
 from train_chroma_nerv import build_model, estimate_model_gflops, representation_sample_ratio
+from train_chroma_nerv import temporal_rgb_error_diff_from_errors
+from train_chroma_nerv import weighted_yuv_psnr_dbavg, weighted_yuv_psnr_mse
 
 
 def generator_kwargs():
@@ -133,6 +136,20 @@ class Chroma420UtilityTests(unittest.TestCase):
         self.assertEqual(cbcr.shape, (1, 2, 8, 12))
         self.assertGreaterEqual(cbcr.min().item(), 0.0)
         self.assertLessEqual(cbcr.max().item(), 1.0)
+
+    def test_weighted_yuv_psnr_dbavg(self):
+        self.assertEqual(weighted_yuv_psnr_dbavg(30, 40, 50), 33.75)
+
+    def test_weighted_yuv_psnr_mse(self):
+        self.assertAlmostEqual(weighted_yuv_psnr_mse(1e-3, 1e-3, 1e-3), 30.0, places=6)
+
+    def test_temporal_rgb_error_diff_zero_for_constant_error(self):
+        errors = [torch.ones(3, 4, 4), torch.ones(3, 4, 4)]
+        self.assertEqual(temporal_rgb_error_diff_from_errors(errors), 0.0)
+
+    def test_temporal_rgb_error_diff_nan_for_single_frame(self):
+        value = temporal_rgb_error_diff_from_errors([torch.ones(3, 4, 4)])
+        self.assertTrue(np.isnan(value))
 
 
 class ChromaGeneratorTests(unittest.TestCase):
