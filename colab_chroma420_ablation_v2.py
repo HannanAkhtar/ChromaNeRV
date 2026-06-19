@@ -157,6 +157,7 @@ def summarize(csv_path=RESULTS_CSV, baseline_run='posthoc420_from_rgb_nervs'):
         'learned_upsampler_width',
         'y_branch_width',
         'rgb_branch_width',
+        'upper_branch_width',
         'params_M',
         'estimated_gflops',
         'model_fps',

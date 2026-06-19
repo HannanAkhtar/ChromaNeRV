@@ -7,7 +7,9 @@ import torch
 from model_chroma_nerv import (
     ChromaGenerator,
     LearnedChromaUpsampler,
+    RGBEarlySplitUpperGenerator,
     RGBAsymGenerator,
+    YUVEarlySplitUpperGenerator,
     apply_posthoc_420_to_rgb,
     downsample_chroma,
     downsample_chroma_420,
@@ -71,6 +73,7 @@ def trainer_args(experiment):
         learned_upsampler_residual=False,
         y_branch_width=2,
         rgb_branch_width=2,
+        upper_branch_width=2,
         chroma_branch_width=2,
     )
 
@@ -114,6 +117,14 @@ class Chroma420UtilityTests(unittest.TestCase):
         self.assertEqual(
             representation_sample_ratio(SimpleNamespace(experiment='rgb_asym', chroma_scale=2)),
             1.0,
+        )
+        self.assertEqual(
+            representation_sample_ratio(SimpleNamespace(experiment='rgb_es180_upper', chroma_scale=4)),
+            1.0,
+        )
+        self.assertEqual(
+            representation_sample_ratio(SimpleNamespace(experiment='yuv_es180_upper', chroma_scale=4)),
+            0.375,
         )
 
     def test_reconstruction_restores_full_resolution(self):
@@ -226,8 +237,59 @@ class ChromaGeneratorTests(unittest.TestCase):
             estimate_model_gflops(wide, embed_input, args),
         )
 
+    def test_rgb_early_split_upper_output_shape(self):
+        kwargs = generator_kwargs()
+        kwargs['stride_list'] = [2, 2, 2]
+        kwargs['upper_branch_width'] = 2
+        model = RGBEarlySplitUpperGenerator(**kwargs)
+        output = model(torch.rand(1, 4))
+        self.assertEqual(output.shape, (1, 3, 16, 24))
+
+    def test_yuv_early_split_upper_output_shapes(self):
+        kwargs = generator_kwargs()
+        kwargs['stride_list'] = [2, 2, 2]
+        kwargs['upper_branch_width'] = 2
+        model = YUVEarlySplitUpperGenerator(**kwargs)
+        output = model(torch.rand(1, 4))
+        self.assertEqual(output['y'].shape, (1, 1, 16, 24))
+        self.assertEqual(output['cbcr_low'].shape, (1, 2, 4, 6))
+
+    def test_narrower_rgb_early_split_upper_reduces_estimated_flops(self):
+        wide_kwargs = generator_kwargs()
+        wide_kwargs['stride_list'] = [2, 2, 2]
+        wide_kwargs['upper_branch_width'] = 4
+        narrow_kwargs = generator_kwargs()
+        narrow_kwargs['stride_list'] = [2, 2, 2]
+        narrow_kwargs['upper_branch_width'] = 2
+        wide = RGBEarlySplitUpperGenerator(**wide_kwargs)
+        narrow = RGBEarlySplitUpperGenerator(**narrow_kwargs)
+        embed_input = torch.rand(1, 4)
+        args = predict_args('rgb_es180_upper')
+        self.assertLess(
+            estimate_model_gflops(narrow, embed_input, args),
+            estimate_model_gflops(wide, embed_input, args),
+        )
+
+    def test_narrower_yuv_early_split_upper_reduces_estimated_flops(self):
+        wide_kwargs = generator_kwargs()
+        wide_kwargs['stride_list'] = [2, 2, 2]
+        wide_kwargs['upper_branch_width'] = 4
+        narrow_kwargs = generator_kwargs()
+        narrow_kwargs['stride_list'] = [2, 2, 2]
+        narrow_kwargs['upper_branch_width'] = 2
+        wide = YUVEarlySplitUpperGenerator(**wide_kwargs)
+        narrow = YUVEarlySplitUpperGenerator(**narrow_kwargs)
+        embed_input = torch.rand(1, 4)
+        args = predict_args('yuv_es180_upper')
+        self.assertLess(
+            estimate_model_gflops(narrow, embed_input, args),
+            estimate_model_gflops(wide, embed_input, args),
+        )
+
     def test_existing_experiments_still_instantiate(self):
-        for experiment in ['rgb444', 'posthoc420', 'neural420_shared', 'neural420_asym_y']:
+        for experiment in [
+                'rgb444', 'posthoc420', 'neural420_shared', 'neural420_asym_y',
+                'rgb_es180_upper', 'yuv_es180_upper']:
             with self.subTest(experiment=experiment):
                 model = build_model(trainer_args(experiment), embed_length=4)
                 self.assertIsNotNone(model)

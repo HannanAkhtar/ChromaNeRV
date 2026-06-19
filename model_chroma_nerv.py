@@ -197,6 +197,23 @@ class ChromaGenerator(nn.Module):
             ngf = width
         return layers, ngf
 
+    @staticmethod
+    def _build_fixed_width_stages(ngf, strides, width, **kwargs):
+        layers = nn.ModuleList()
+        for stride in strides:
+            for block_index in range(kwargs['num_blocks']):
+                layers.append(NeRVBlock(
+                    ngf=ngf,
+                    new_ngf=width,
+                    stride=1 if block_index else stride,
+                    bias=kwargs['bias'],
+                    norm=kwargs['norm'],
+                    act=kwargs['act'],
+                    conv_type=kwargs['conv_type'],
+                ))
+                ngf = width
+        return layers, ngf
+
     def _normalize(self, tensor):
         return torch.sigmoid(tensor) if self.sigmoid else (torch.tanh(tensor) + 1) * 0.5
 
@@ -265,3 +282,115 @@ class RGBAsymGenerator(nn.Module):
         for layer in self.rgb_layers:
             features = layer(features)
         return self._normalize(self.rgb_head(features))
+
+
+class RGBEarlySplitUpperGenerator(nn.Module):
+    """RGB baseline that compresses the two upper decoder stages after a 180p split."""
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.sigmoid = kwargs['sigmoid']
+        stem_dim, stem_num = [int(x) for x in kwargs['stem_dim_num'].split('_')]
+        self.fc_h, self.fc_w, self.fc_dim = [int(x) for x in kwargs['fc_hw_dim'].split('_')]
+        mlp_dims = (
+            [kwargs['embed_length']]
+            + [stem_dim] * stem_num
+            + [self.fc_h * self.fc_w * self.fc_dim]
+        )
+        self.stem = MLP(dim_list=mlp_dims, act=kwargs['act'])
+
+        stride_list = kwargs['stride_list']
+        if len(stride_list) < 2:
+            raise ValueError('early-split upper model requires at least two upper strides')
+        shared_strides = stride_list[:-2]
+        upper_strides = stride_list[-2:]
+
+        self.shared_layers, ngf = ChromaGenerator._build_stages(
+            self.fc_dim, shared_strides, 0, **kwargs)
+        upper_width = kwargs.get('upper_branch_width', kwargs.get('rgb_branch_width', ngf))
+        self.rgb_adapter = (
+            nn.Identity()
+            if upper_width == ngf
+            else nn.Conv2d(ngf, upper_width, 1, 1, bias=kwargs['bias'])
+        )
+        self.rgb_upper_layers, ngf = ChromaGenerator._build_fixed_width_stages(
+            upper_width, upper_strides, upper_width, **kwargs)
+        self.rgb_head = nn.Conv2d(ngf, 3, 1, 1, bias=kwargs['bias'])
+
+    def _normalize(self, tensor):
+        return torch.sigmoid(tensor) if self.sigmoid else (torch.tanh(tensor) + 1) * 0.5
+
+    def forward(self, inputs):
+        features = self.stem(inputs)
+        features = features.view(features.size(0), self.fc_dim, self.fc_h, self.fc_w)
+        for layer in self.shared_layers:
+            features = layer(features)
+        features = self.rgb_adapter(features)
+        for layer in self.rgb_upper_layers:
+            features = layer(features)
+        return self._normalize(self.rgb_head(features))
+
+
+class YUVEarlySplitUpperGenerator(nn.Module):
+    """YUV ChromaNeRV variant with chroma exiting at 180p and compressed upper Y branch."""
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.sigmoid = kwargs['sigmoid']
+        self.chroma_scale = 4
+        self.chroma_resize_mode = kwargs.get('chroma_downsample', 'area')
+        self.learned_upsampler = None
+        if kwargs.get('chroma_upsampler') == 'learned':
+            self.learned_upsampler = LearnedChromaUpsampler(
+                width=kwargs.get('learned_upsampler_width', 16),
+                depth=kwargs.get('learned_upsampler_depth', 2),
+                residual=kwargs.get('learned_upsampler_residual', False),
+            )
+
+        stem_dim, stem_num = [int(x) for x in kwargs['stem_dim_num'].split('_')]
+        self.fc_h, self.fc_w, self.fc_dim = [int(x) for x in kwargs['fc_hw_dim'].split('_')]
+        mlp_dims = (
+            [kwargs['embed_length']]
+            + [stem_dim] * stem_num
+            + [self.fc_h * self.fc_w * self.fc_dim]
+        )
+        self.stem = MLP(dim_list=mlp_dims, act=kwargs['act'])
+
+        stride_list = kwargs['stride_list']
+        if len(stride_list) < 2:
+            raise ValueError('early-split upper model requires at least two upper strides')
+        shared_strides = stride_list[:-2]
+        upper_strides = stride_list[-2:]
+
+        self.shared_layers, ngf = ChromaGenerator._build_stages(
+            self.fc_dim, shared_strides, 0, **kwargs)
+        self.cbcr_head = nn.Conv2d(ngf, 2, 1, 1, bias=kwargs['bias'])
+        upper_width = kwargs.get('upper_branch_width', kwargs.get('y_branch_width', ngf))
+        self.y_adapter = (
+            nn.Identity()
+            if upper_width == ngf
+            else nn.Conv2d(ngf, upper_width, 1, 1, bias=kwargs['bias'])
+        )
+        self.y_upper_layers, ngf = ChromaGenerator._build_fixed_width_stages(
+            upper_width, upper_strides, upper_width, **kwargs)
+        self.y_head = nn.Conv2d(ngf, 1, 1, 1, bias=kwargs['bias'])
+
+    def _normalize(self, tensor):
+        return torch.sigmoid(tensor) if self.sigmoid else (torch.tanh(tensor) + 1) * 0.5
+
+    def forward(self, inputs):
+        features = self.stem(inputs)
+        features = features.view(features.size(0), self.fc_dim, self.fc_h, self.fc_w)
+        for layer in self.shared_layers:
+            features = layer(features)
+
+        cbcr_low = self._normalize(self.cbcr_head(features))
+        y_features = self.y_adapter(features)
+        for layer in self.y_upper_layers:
+            y_features = layer(y_features)
+        y = self._normalize(self.y_head(y_features))
+
+        target_size = (y.shape[-2] // self.chroma_scale, y.shape[-1] // self.chroma_scale)
+        if cbcr_low.shape[-2:] != target_size:
+            cbcr_low = resize_chroma(cbcr_low, target_size, self.chroma_resize_mode)
+        return {'y': y, 'cbcr_low': cbcr_low}

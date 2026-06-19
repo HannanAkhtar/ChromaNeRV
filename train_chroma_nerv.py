@@ -20,7 +20,9 @@ from torchvision.utils import save_image
 
 from model_chroma_nerv import (
     ChromaGenerator,
+    RGBEarlySplitUpperGenerator,
     RGBAsymGenerator,
+    YUVEarlySplitUpperGenerator,
     apply_posthoc_420_to_rgb,
     downsample_chroma,
     reconstruct_rgb_from_y_and_chroma,
@@ -43,8 +45,10 @@ EXPERIMENTS_NEURAL_420 = {
     'neural420_shared_learned_up',
     'neural420_early_chroma',
     'neural420_asym_y',
+    'yuv_es180_upper',
 }
 EXPERIMENTS_420 = {'posthoc420'} | EXPERIMENTS_NEURAL_420
+EXPERIMENTS_RGB_DIRECT = {'rgb_asym', 'rgb_es180_upper'}
 CSV_FIELDS = [
     'timestamp',
     'run_name',
@@ -87,6 +91,7 @@ CSV_FIELDS = [
     'learned_upsampler_residual',
     'y_branch_width',
     'rgb_branch_width',
+    'upper_branch_width',
     'chroma_branch_width',
     'visual_dir',
     'out_dir',
@@ -118,6 +123,8 @@ def parse_args():
             'neural420_early_chroma',
             'neural420_asym_y',
             'rgb_asym',
+            'rgb_es180_upper',
+            'yuv_es180_upper',
         ],
     )
     parser.add_argument(
@@ -143,6 +150,7 @@ def parse_args():
     parser.add_argument('--chroma_scale', type=int, default=2, choices=[2, 4])
     parser.add_argument('--y_branch_width', type=int, default=96)
     parser.add_argument('--rgb_branch_width', type=int, default=96)
+    parser.add_argument('--upper_branch_width', type=int, default=96)
     parser.add_argument('--chroma_branch_width', type=int, default=96)
     parser.add_argument('--ablation_group', default='')
 
@@ -198,7 +206,13 @@ def parse_args():
 
 
 def resolve_args(args):
-    expected_space = {'rgb444': 'rgb', 'rgb_asym': 'rgb', 'ycbcr444': 'ycbcr'}.get(args.experiment)
+    expected_space = {
+        'rgb444': 'rgb',
+        'rgb_asym': 'rgb',
+        'rgb_es180_upper': 'rgb',
+        'ycbcr444': 'ycbcr',
+        'yuv_es180_upper': 'ycbcr',
+    }.get(args.experiment)
     if expected_space is not None and args.color_space not in {None, expected_space}:
         raise ValueError(f'{args.experiment} requires --color_space {expected_space}')
     if args.experiment in EXPERIMENTS_NEURAL_420 and args.color_space not in {None, 'ycbcr'}:
@@ -214,6 +228,8 @@ def resolve_args(args):
     args.chroma_upsampler = args.chroma_upsampler or args.chroma_upsample
     if args.experiment == 'neural420_shared_learned_up':
         args.chroma_upsampler = 'learned'
+    if args.experiment == 'yuv_es180_upper':
+        args.chroma_scale = 4
 
     args.warmup = int(args.warmup * args.epochs)
     args.run_name = args.run_name or f"{args.experiment}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -248,12 +264,17 @@ def model_kwargs(args, embed_length):
         'learned_upsampler_residual': args.learned_upsampler_residual,
         'y_branch_width': args.y_branch_width,
         'rgb_branch_width': args.rgb_branch_width,
+        'upper_branch_width': args.upper_branch_width,
         'chroma_branch_width': args.chroma_branch_width,
     }
 
 
 def build_model(args, embed_length):
     kwargs = model_kwargs(args, embed_length)
+    if args.experiment == 'rgb_es180_upper':
+        return RGBEarlySplitUpperGenerator(**kwargs)
+    if args.experiment == 'yuv_es180_upper':
+        return YUVEarlySplitUpperGenerator(**kwargs)
     if args.experiment == 'rgb_asym':
         return RGBAsymGenerator(**kwargs)
     if args.experiment in EXPERIMENTS_NEURAL_420:
@@ -293,7 +314,7 @@ def save_checkpoint(path, model, optimizer, epoch, best_rgb_psnr, args):
 
 
 def predict(model, embed_input, args):
-    if args.experiment == 'rgb_asym':
+    if args.experiment in EXPERIMENTS_RGB_DIRECT:
         rgb = model(embed_input)
         return {'rgb': rgb, 'ycbcr': rgb_to_ycbcr_bt709(rgb), 'cbcr_low': None}
 
@@ -325,7 +346,7 @@ def predict(model, embed_input, args):
 
 
 def compute_train_loss(model, embed_input, rgb_target, args):
-    if args.experiment == 'rgb_asym':
+    if args.experiment in EXPERIMENTS_RGB_DIRECT:
         rgb_output = model(embed_input)
         loss = loss_fn(rgb_output, rgb_target, args)
         return loss, {'loss': loss.item()}
@@ -559,6 +580,7 @@ def append_csv(metrics, checkpoint_path, visual_dir, args):
         'learned_upsampler_residual': args.learned_upsampler_residual,
         'y_branch_width': args.y_branch_width,
         'rgb_branch_width': args.rgb_branch_width,
+        'upper_branch_width': args.upper_branch_width,
         'chroma_branch_width': args.chroma_branch_width,
         'visual_dir': visual_dir,
         'out_dir': args.out_dir,
