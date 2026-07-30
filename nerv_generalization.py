@@ -148,6 +148,64 @@ def inspect_frame_resolution(frame_paths):
     return expected
 
 
+def resolve_spatial_preprocessing(
+        source_resolution,
+        target_resolution,
+        allow_resize=False):
+    source_resolution = tuple(source_resolution)
+    target_resolution = tuple(target_resolution)
+    source_height, source_width = source_resolution
+    target_height, target_width = target_resolution
+    metadata = {
+        'source_resolution': list(source_resolution),
+        'target_resolution': list(target_resolution),
+        'preprocessing_mode': 'none',
+        'spatial_transform': 'none',
+        'crop_top': 0,
+        'crop_left': 0,
+        'crop_height': target_height,
+        'crop_width': target_width,
+        'crop_parameters': None,
+        'resize_applied': False,
+    }
+    if source_resolution == target_resolution:
+        return metadata
+    if source_resolution == (1080, 1920) and target_resolution == (960, 1920):
+        crop_top = (source_height - target_height) // 2
+        crop_left = (source_width - target_width) // 2
+        metadata.update({
+            'preprocessing_mode': 'center_crop',
+            'spatial_transform': 'center_crop',
+            'crop_top': crop_top,
+            'crop_left': crop_left,
+            'crop_height': target_height,
+            'crop_width': target_width,
+            'crop_parameters': {
+                'top': crop_top,
+                'left': crop_left,
+                'height': target_height,
+                'width': target_width,
+            },
+        })
+        return metadata
+    if allow_resize:
+        metadata.update({
+            'preprocessing_mode': 'resize',
+            'spatial_transform': 'resize',
+            'crop_height': source_height,
+            'crop_width': source_width,
+            'resize_applied': True,
+        })
+        return metadata
+    raise ValueError(
+        f'Detected source resolution {source_height}x{source_width}; requested '
+        f'target resolution {target_height}x{target_width}. Supported production '
+        'source resolutions are 960x1920 (unchanged) and 1080x1920 '
+        '(deterministic center crop to 960x1920). No implicit resizing was '
+        'performed. Use --allow_resize only for an intentional compatibility '
+        'or debug run.')
+
+
 class UVGSequenceDataset(Dataset):
     def __init__(
             self,
@@ -165,13 +223,11 @@ class UVGSequenceDataset(Dataset):
         self.source_resolution = inspect_frame_resolution(self.frame_paths)
         self.target_resolution = (target_height, target_width)
         self.allow_resize = allow_resize
-        if self.source_resolution != self.target_resolution and not allow_resize:
-            height, width = self.source_resolution
-            raise ValueError(
-                f'{sequence} frames are {height}x{width}; expected '
-                f'{target_height}x{target_width}. No frames were resized. '
-                'Use --allow_resize with explicit --target_height and --target_width '
-                'only for an intentional compatibility or smoke run.')
+        self.preprocessing_metadata = resolve_spatial_preprocessing(
+            self.source_resolution,
+            self.target_resolution,
+            allow_resize,
+        )
         self.selected_frame_names = [
             str(path.relative_to(self.data_root)).replace('\\', '/')
             for path in self.frame_paths
@@ -185,12 +241,23 @@ class UVGSequenceDataset(Dataset):
         path = self.frame_paths[source_index]
         with Image.open(path) as image:
             image = image.convert('RGB')
-            if self.source_resolution != self.target_resolution:
+            mode = self.preprocessing_metadata['preprocessing_mode']
+            if mode == 'center_crop':
+                top = self.preprocessing_metadata['crop_top']
+                left = self.preprocessing_metadata['crop_left']
+                height = self.preprocessing_metadata['crop_height']
+                width = self.preprocessing_metadata['crop_width']
+                image = image.crop((left, top, left + width, top + height))
+            elif mode == 'resize':
                 image = image.resize(
                     (self.target_resolution[1], self.target_resolution[0]),
                     Image.Resampling.BICUBIC,
                 )
             tensor = TF.to_tensor(image)
+        if tuple(tensor.shape[-2:]) != self.target_resolution:
+            raise AssertionError(
+                f'Preprocessed frame has shape {tuple(tensor.shape)}, expected '
+                f'[3, {self.target_resolution[0]}, {self.target_resolution[1]}]')
         norm_index = torch.tensor(
             source_index / len(self.frame_paths),
             dtype=torch.float32,

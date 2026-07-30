@@ -19,7 +19,25 @@ are not part of this primary supplementary grid.
 The default sequence list is Beauty, Bosphorus, HoneyBee, Jockey, ReadySetGo,
 ShakeNDry, and YachtRide. PNG is preferred over JPG/JPEG, names are naturally
 sorted, and exactly the first 132 frames are selected. Main runs require
-960x1920 inputs and never resize implicitly.
+960x1920 model inputs and never resize implicitly.
+
+Production UVG frames may be stored at either 960x1920 or 1080x1920. Frames
+already at 960x1920 are used unchanged. Frames at exactly 1080x1920 receive the
+same deterministic center crop used by the ChromaHNeRV experiments:
+
+```text
+top=60, left=0, height=960, width=1920
+```
+
+This removes 60 rows from the top and bottom, removes no columns, and performs
+no interpolation. No other automatic crop is supported. Any other source
+resolution fails unless `--allow_resize` is explicitly supplied for a
+compatibility or debug run.
+
+Each run records the source and target resolutions, preprocessing mode, crop
+coordinates, and resize flag in `config.json` and `environment.json`. These
+fields are included in the scientific configuration hash, preventing runs with
+different spatial preprocessing from being resumed or treated as equivalent.
 
 The 960x1920 NeRV-S preset is:
 

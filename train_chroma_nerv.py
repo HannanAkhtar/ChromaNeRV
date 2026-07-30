@@ -55,6 +55,7 @@ from persistence import (
     atomic_write_json,
     persist_resume_checkpoint,
     retry_operation,
+    stable_config_hash,
 )
 from utils import (
     PositionalEncoding,
@@ -853,6 +854,10 @@ def main():
             read_json(args.job_config_json)
             if args.job_config_json else vars(args).copy()
         )
+        preprocessing = dict(val_dataset.preprocessing_metadata)
+        config.update(preprocessing)
+        config['preprocessing'] = preprocessing
+        config['config_hash'] = stable_config_hash(config)
         write_json(os.path.join(args.out_dir, 'config.json'), config)
         with open(os.path.join(args.out_dir, 'command.txt'), 'w', encoding='utf-8') as handle:
             handle.write(subprocess.list2cmdline([sys.executable] + sys.argv) + '\n')
@@ -871,6 +876,10 @@ def main():
             'selected_frame_filenames': val_dataset.selected_frame_names,
             'source_resolution': list(val_dataset.source_resolution),
             'target_resolution': list(val_dataset.target_resolution),
+            'preprocessing_mode': preprocessing['preprocessing_mode'],
+            'crop_parameters': preprocessing['crop_parameters'],
+            'resize_applied': preprocessing['resize_applied'],
+            'preprocessing': preprocessing,
             'parameter_count': sum(p.numel() for p in model.parameters() if p.requires_grad),
             'checkpoint_policy': args.checkpoint_policy,
             'model_arguments': model_kwargs(args, positional_encoding.embed_length),

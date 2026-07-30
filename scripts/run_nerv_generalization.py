@@ -19,8 +19,10 @@ from nerv_generalization import (  # noqa: E402
     discover_sequence_frames,
     environment_info,
     git_commit,
+    inspect_frame_resolution,
     parse_csv_names,
     read_json,
+    resolve_spatial_preprocessing,
     write_json,
 )
 from persistence import (  # noqa: E402
@@ -52,6 +54,7 @@ def parse_args():
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--dry_run', action='store_true')
     parser.add_argument('--smoke_test', action='store_true')
+    parser.add_argument('--allow_resize', action='store_true')
     parser.add_argument('--keep_predictions', action='store_true')
     parser.add_argument('--skip_vmaf', action='store_true')
     parser.add_argument('--skip_fid', action='store_true')
@@ -119,8 +122,10 @@ def build_command(args, job, run_dir, config_path, evaluation_only=False):
         '--eval_freq', str(job['epochs']),
         '--save_predictions',
     ]
+    if args.smoke_test or args.allow_resize:
+        command.append('--allow_resize')
     if args.smoke_test:
-        command.extend(['--allow_resize', '--debug'])
+        command.append('--debug')
     if not args.skip_vmaf:
         command.append('--compute_vmaf')
     if args.resume:
@@ -263,6 +268,13 @@ def main():
         job['checkpoint_policy'] = args.checkpoint_policy
         selected = discover_sequence_frames(
             args.data_root, job['sequence'], args.max_frames)
+        source_resolution = inspect_frame_resolution(selected)
+        architecture = job['architecture']
+        preprocessing = resolve_spatial_preprocessing(
+            source_resolution,
+            (architecture['target_height'], architecture['target_width']),
+            allow_resize=args.smoke_test or args.allow_resize,
+        )
         job['selected_frame_names'] = [
             str(path.relative_to(Path(args.data_root))).replace('\\', '/')
             for path in selected
@@ -273,6 +285,8 @@ def main():
             if persistent_root else None
         )
         job.update({
+            **preprocessing,
+            'preprocessing': preprocessing,
             'local_run_dir': str(local_run_dir.resolve()),
             'persistent_run_dir': (
                 str(persistent_run_dir.resolve()) if persistent_run_dir else None),

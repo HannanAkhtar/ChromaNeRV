@@ -9,6 +9,7 @@ from unittest import mock
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 from PIL import Image
 
 from metrics.main_paper_metrics import (
@@ -31,6 +32,7 @@ from nerv_generalization import (
     run_is_complete,
     write_json,
 )
+from persistence import stable_config_hash
 from scripts.aggregate_nerv_generalization import equal_sequence_average
 from train_chroma_nerv import (
     build_model,
@@ -193,6 +195,101 @@ class NeRVGeneralizationTests(unittest.TestCase):
             dataset = UVGSequenceDataset(
                 directory, 'Beauty', target_height=1, target_width=2)
             self.assertEqual(len(dataset), 132)
+
+    def test_production_center_crop_preserves_exact_rows_and_width(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sequence = Path(directory) / 'Beauty'
+            sequence.mkdir()
+            row_values = (np.arange(1080, dtype=np.uint16) % 256).astype(np.uint8)
+            image = np.broadcast_to(
+                row_values[:, None, None], (1080, 1920, 3)).copy()
+            Image.fromarray(image, mode='RGB').save(sequence / 'frame1.png')
+
+            dataset = UVGSequenceDataset(
+                directory,
+                'Beauty',
+                max_frames=1,
+                target_height=960,
+                target_width=1920,
+            )
+            tensor, _ = dataset[0]
+            self.assertEqual(tuple(tensor.shape), (3, 960, 1920))
+            output_bytes = (tensor * 255).round().to(torch.uint8)
+            self.assertEqual(output_bytes[0, 0, 0].item(), 60)
+            self.assertEqual(output_bytes[0, -1, 0].item(), 1019 % 256)
+            self.assertEqual(output_bytes.shape[-1], 1920)
+            self.assertEqual(dataset.preprocessing_metadata['preprocessing_mode'], 'center_crop')
+            self.assertEqual(dataset.preprocessing_metadata['crop_top'], 60)
+            self.assertEqual(dataset.preprocessing_metadata['crop_left'], 0)
+            self.assertEqual(dataset.preprocessing_metadata['crop_height'], 960)
+            self.assertEqual(dataset.preprocessing_metadata['crop_width'], 1920)
+            self.assertFalse(dataset.preprocessing_metadata['resize_applied'])
+
+    def test_already_correct_production_frame_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sequence = Path(directory) / 'Beauty'
+            sequence.mkdir()
+            image = np.zeros((960, 1920, 3), dtype=np.uint8)
+            image[..., 0] = np.arange(1920, dtype=np.uint16) % 256
+            image[..., 1] = 71
+            image[..., 2] = 203
+            Image.fromarray(image, mode='RGB').save(sequence / 'frame1.png')
+            dataset = UVGSequenceDataset(
+                directory, 'Beauty', max_frames=1)
+            tensor, _ = dataset[0]
+            restored = (
+                (tensor * 255).round().to(torch.uint8)
+                .permute(1, 2, 0).numpy()
+            )
+            self.assertTrue(np.array_equal(restored, image))
+            self.assertEqual(dataset.preprocessing_metadata['preprocessing_mode'], 'none')
+            self.assertFalse(dataset.preprocessing_metadata['resize_applied'])
+
+    def test_unsupported_resolution_requires_explicit_resize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sequence = Path(directory) / 'Beauty'
+            sequence.mkdir()
+            Image.new('RGB', (200, 100), (10, 20, 30)).save(
+                sequence / 'frame1.png')
+            with self.assertRaisesRegex(
+                    ValueError,
+                    'Detected source resolution 100x200.*No implicit resizing'):
+                UVGSequenceDataset(
+                    directory,
+                    'Beauty',
+                    max_frames=1,
+                    target_height=16,
+                    target_width=32,
+                )
+            dataset = UVGSequenceDataset(
+                directory,
+                'Beauty',
+                max_frames=1,
+                target_height=16,
+                target_width=32,
+                allow_resize=True,
+            )
+            tensor, _ = dataset[0]
+            self.assertEqual(tuple(tensor.shape), (3, 16, 32))
+            self.assertEqual(dataset.preprocessing_metadata['preprocessing_mode'], 'resize')
+            self.assertTrue(dataset.preprocessing_metadata['resize_applied'])
+
+    def test_preprocessing_changes_scientific_config_hash(self):
+        base = {
+            'sequence': 'Beauty',
+            'source_resolution': [1080, 1920],
+            'target_resolution': [960, 1920],
+            'preprocessing_mode': 'center_crop',
+            'crop_top': 60,
+            'crop_left': 0,
+            'crop_height': 960,
+            'crop_width': 1920,
+            'resize_applied': False,
+        }
+        shifted = dict(base, crop_top=59)
+        resized = dict(base, preprocessing_mode='resize', resize_applied=True)
+        self.assertNotEqual(stable_config_hash(base), stable_config_hash(shifted))
+        self.assertNotEqual(stable_config_hash(base), stable_config_hash(resized))
 
     def test_incomplete_run_is_not_complete(self):
         with tempfile.TemporaryDirectory() as directory:
