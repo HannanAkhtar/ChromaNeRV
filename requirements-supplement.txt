@@ -1,0 +1,12 @@
+# Install alongside the repository requirements. PyTorch/torchvision are intentionally omitted.
+pytorch-msssim>=0.2.1
+lpips>=0.1.4
+DISTS-pytorch>=0.1
+torchmetrics[image]>=1.2
+torch-fidelity>=0.3.0
+scipy>=1.8
+pandas>=1.5
+matplotlib>=3.5
+Pillow>=8.4
+tqdm>=4.59
+

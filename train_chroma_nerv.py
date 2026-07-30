@@ -2,20 +2,20 @@ from __future__ import print_function
 
 import argparse
 import csv
+import json
 import os
-import random
 import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime
 
 import numpy as np
 import torch
-import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
 import torchvision.transforms as transforms
-from pytorch_msssim import ms_ssim, ssim
 from torchvision.utils import save_image
 
 from model_chroma_nerv import (
@@ -28,6 +28,29 @@ from model_chroma_nerv import (
     reconstruct_rgb_from_y_and_chroma,
 )
 from model_nerv import CustomDataSet, Generator
+from metrics.main_paper_metrics import (
+    SequenceMetricAccumulator,
+    build_dists_model,
+    build_lpips_model,
+    calculate_psnr,
+    compute_vmaf,
+    evaluate_dists,
+    evaluate_lpips,
+    frame_psnr_values,
+    psnr_from_mse,
+    safe_ms_ssim,
+    safe_ssim,
+    temporal_rgb_error_diff_from_errors,
+    weighted_yuv_psnr_dbavg,
+    weighted_yuv_psnr_mse,
+)
+from nerv_generalization import (
+    UVGSequenceDataset,
+    environment_info,
+    read_json,
+    set_reproducibility,
+    write_json,
+)
 from utils import (
     PositionalEncoding,
     adjust_lr,
@@ -62,6 +85,7 @@ CSV_FIELDS = [
     'checkpoint_size_MB',
     'model_fps',
     'end_to_end_fps',
+    'estimated_macs_g',
     'estimated_gflops',
     'rgb_psnr',
     'rgb_ms_ssim',
@@ -75,6 +99,8 @@ CSV_FIELDS = [
     'ssim_cr',
     'yuv_ssim_611',
     'lpips_alex',
+    'dists',
+    'vmaf',
     'frame_psnr_mean',
     'frame_psnr_std',
     'frame_y_psnr_mean',
@@ -108,6 +134,12 @@ def parse_args():
     parser.add_argument('--test_gap', type=int, default=1)
     parser.add_argument('--dataset', type=str, default='UVG')
     parser.add_argument('--data_dir', type=str, default=None)
+    parser.add_argument('--data_root', type=str, default=None)
+    parser.add_argument('--sequence', type=str, default=None)
+    parser.add_argument('--max_frames', type=int, default=132)
+    parser.add_argument('--allow_resize', action='store_true')
+    parser.add_argument('--target_height', type=int, default=960)
+    parser.add_argument('--target_width', type=int, default=1920)
 
     # Experiment
     parser.add_argument(
@@ -186,12 +218,21 @@ def parse_args():
     parser.add_argument('--loss_type', type=str, default='L2')
     parser.add_argument('--lw', type=float, default=1.0)
     parser.add_argument('--manualSeed', type=int, default=1)
+    parser.add_argument('--cuda_deterministic', action='store_true')
+    parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'])
 
     # Evaluation and output
     parser.add_argument('--eval_only', action='store_true')
     parser.add_argument('--eval_freq', type=int, default=50)
     parser.add_argument('--fps_warmup', type=int, default=2)
     parser.add_argument('--fps_repeats', type=int, default=10)
+    parser.add_argument('--save_predictions', action='store_true')
+    parser.add_argument('--compute_vmaf', action='store_true')
+    parser.add_argument('--vmaf_fps', type=int, default=30)
+    parser.add_argument('--vmaf_model_path', default=None)
+    parser.add_argument('--rate_eval', action='store_true')
+    parser.add_argument('--checkpoint_policy', choices=['final', 'best'], default='final')
+    parser.add_argument('--job_config_json', default=None)
     parser.add_argument('--visual_frames', type=int, default=1)
     parser.add_argument('--weight', default=None, type=str)
     parser.add_argument('--resume', action='store_true')
@@ -233,7 +274,10 @@ def resolve_args(args):
 
     args.warmup = int(args.warmup * args.epochs)
     args.run_name = args.run_name or f"{args.experiment}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    args.out_dir = os.path.join(args.outf, args.dataset.lower(), args.run_name)
+    args.out_dir = (
+        args.outf if args.data_root
+        else os.path.join(args.outf, args.dataset.lower(), args.run_name)
+    )
     args.data_dir = args.data_dir or os.path.join('data', args.dataset.lower())
     if args.debug:
         args.eval_freq = 1
@@ -272,14 +316,16 @@ def model_kwargs(args, embed_length):
 def build_model(args, embed_length):
     kwargs = model_kwargs(args, embed_length)
     if args.experiment == 'rgb_es180_upper':
-        return RGBEarlySplitUpperGenerator(**kwargs)
-    if args.experiment == 'yuv_es180_upper':
-        return YUVEarlySplitUpperGenerator(**kwargs)
-    if args.experiment == 'rgb_asym':
-        return RGBAsymGenerator(**kwargs)
-    if args.experiment in EXPERIMENTS_NEURAL_420:
-        return ChromaGenerator(args.experiment, **kwargs)
-    return Generator(**kwargs)
+        model = RGBEarlySplitUpperGenerator(**kwargs)
+    elif args.experiment == 'yuv_es180_upper':
+        model = YUVEarlySplitUpperGenerator(**kwargs)
+    elif args.experiment == 'rgb_asym':
+        model = RGBAsymGenerator(**kwargs)
+    elif args.experiment in EXPERIMENTS_NEURAL_420:
+        model = ChromaGenerator(args.experiment, **kwargs)
+    else:
+        model = Generator(**kwargs)
+    return model
 
 
 def unwrap_state_dict(checkpoint):
@@ -316,7 +362,9 @@ def save_checkpoint(path, model, optimizer, epoch, best_rgb_psnr, args):
 def predict(model, embed_input, args):
     if args.experiment in EXPERIMENTS_RGB_DIRECT:
         rgb = model(embed_input)
-        return {'rgb': rgb, 'ycbcr': rgb_to_ycbcr_bt709(rgb), 'cbcr_low': None}
+        prediction = {'rgb': rgb, 'ycbcr': rgb_to_ycbcr_bt709(rgb), 'cbcr_low': None}
+        validate_prediction_shapes(prediction, args)
+        return prediction
 
     if args.experiment in EXPERIMENTS_NEURAL_420:
         output = model(embed_input)
@@ -326,11 +374,13 @@ def predict(model, embed_input, args):
             chroma_upsampler=args.chroma_upsampler,
             learned_upsampler=getattr(model, 'learned_upsampler', None),
         )
-        return {
+        prediction = {
             'rgb': rgb,
             'ycbcr': rgb_to_ycbcr_bt709(rgb),
             'cbcr_low': output['cbcr_low'],
         }
+        validate_prediction_shapes(prediction, args)
+        return prediction
 
     model_output = model(embed_input)[-1]
     rgb = model_output_to_rgb(model_output, args.color_space, clamp=True)
@@ -341,8 +391,31 @@ def predict(model, embed_input, args):
             args.chroma_upsample,
             return_components=True,
         )
-        return {'rgb': rgb, 'ycbcr': rgb_to_ycbcr_bt709(rgb), 'cbcr_low': cbcr_low}
-    return {'rgb': rgb, 'ycbcr': rgb_to_ycbcr_bt709(rgb), 'cbcr_low': None}
+        prediction = {'rgb': rgb, 'ycbcr': rgb_to_ycbcr_bt709(rgb), 'cbcr_low': cbcr_low}
+    else:
+        prediction = {'rgb': rgb, 'ycbcr': rgb_to_ycbcr_bt709(rgb), 'cbcr_low': None}
+    validate_prediction_shapes(prediction, args)
+    return prediction
+
+
+def validate_prediction_shapes(prediction, args):
+    if not getattr(args, 'data_root', None):
+        return
+    expected = (args.target_height, args.target_width)
+    actual = tuple(prediction['rgb'].shape[-2:])
+    if actual != expected:
+        raise AssertionError(
+            f'Model output resolution is {actual[0]}x{actual[1]}, expected '
+            f'{expected[0]}x{expected[1]}. Check fc_hw_dim and strides.')
+    if args.experiment in EXPERIMENTS_NEURAL_420:
+        expected_chroma = (
+            args.target_height // args.chroma_scale,
+            args.target_width // args.chroma_scale,
+        )
+        actual_chroma = tuple(prediction['cbcr_low'].shape[-2:])
+        if actual_chroma != expected_chroma:
+            raise AssertionError(
+                f'Low-resolution chroma is {actual_chroma}, expected {expected_chroma}')
 
 
 def compute_train_loss(model, embed_input, rgb_target, args):
@@ -441,6 +514,11 @@ def estimate_model_gflops(model, embed_input, args):
     return operation_count[0] / 1e9
 
 
+def estimate_model_macs_and_gflops(model, embed_input, args):
+    gflops = estimate_model_gflops(model, embed_input, args)
+    return gflops / 2.0, gflops
+
+
 def representation_sample_ratio(args):
     if args.experiment not in EXPERIMENTS_420:
         return 1.0
@@ -448,63 +526,9 @@ def representation_sample_ratio(args):
     return (1 + 2 / chroma_scale ** 2) / 3
 
 
-def psnr_from_mse(mse):
-    return float('inf') if mse == 0 else -10 * np.log10(mse)
-
-
-def calculate_psnr(sum_squared_error, count):
-    mse = sum_squared_error / count
-    return psnr_from_mse(mse)
-
-
-def weighted_yuv_psnr_dbavg(psnr_y, psnr_cb, psnr_cr):
-    return (6 * psnr_y + psnr_cb + psnr_cr) / 8
-
-
-def weighted_yuv_psnr_mse(mse_y, mse_cb, mse_cr):
-    weighted_mse = (6 * mse_y + mse_cb + mse_cr) / 8
-    return psnr_from_mse(weighted_mse)
-
-
-def frame_psnr_values(error_tensor):
-    per_frame_mse = error_tensor.square().flatten(1).mean(dim=1).detach().cpu().numpy()
-    return [psnr_from_mse(float(mse)) for mse in per_frame_mse]
-
-
-def temporal_rgb_error_diff_from_errors(errors):
-    if len(errors) < 2:
-        return float('nan')
-    diffs = [
-        (cur - prev).abs().mean().item()
-        for prev, cur in zip(errors[:-1], errors[1:])
-    ]
-    return float(np.mean(diffs))
-
-
-def safe_ms_ssim(rgb_output, rgb_target):
-    try:
-        return ms_ssim(rgb_output, rgb_target, data_range=1, size_average=True).item()
-    except AssertionError:
-        # Small debug frames cannot pass through all MS-SSIM downsamplings.
-        return ssim(rgb_output, rgb_target, data_range=1, size_average=True).item()
-
-
-def safe_ssim(channel_output, channel_target):
-    try:
-        return ssim(channel_output, channel_target, data_range=1, size_average=True).item()
-    except AssertionError:
-        return float('nan')
-
-
-def build_lpips_model(device):
-    try:
-        import lpips
-        model = lpips.LPIPS(net='alex').to(device)
-        model.eval()
-        return model
-    except Exception as exc:
-        print(f'LPIPS unavailable; writing NaN. Reason: {exc}')
-        return None
+def optional_metric_mean(values):
+    finite = [float(value) for value in values if np.isfinite(value)]
+    return float(np.mean(finite)) if finite else float('nan')
 
 
 def save_visuals(prediction, rgb_target, ycbcr_target, visual_dir, start_index, args):
@@ -538,6 +562,10 @@ def append_csv(metrics, checkpoint_path, visual_dir, args):
         os.makedirs(csv_dir, exist_ok=True)
     write_header = not os.path.isfile(args.results_csv)
     checkpoint_size = os.path.getsize(checkpoint_path) / (1024 ** 2) if os.path.isfile(checkpoint_path) else 0
+    def optional_text(key, digits=6):
+        value = metrics.get(key)
+        return '' if value is None or not np.isfinite(value) else f'{value:.{digits}f}'
+
     row = {
         'timestamp': datetime.now().isoformat(timespec='seconds'),
         'run_name': args.run_name,
@@ -551,6 +579,7 @@ def append_csv(metrics, checkpoint_path, visual_dir, args):
         'checkpoint_size_MB': f'{checkpoint_size:.6f}',
         'model_fps': f"{metrics['model_fps']:.4f}",
         'end_to_end_fps': f"{metrics['end_to_end_fps']:.4f}",
+        'estimated_macs_g': f"{metrics['estimated_macs_g']:.6f}",
         'estimated_gflops': f"{metrics['estimated_gflops']:.4f}",
         'rgb_psnr': f"{metrics['rgb_psnr']:.4f}",
         'rgb_ms_ssim': f"{metrics['rgb_ms_ssim']:.6f}",
@@ -563,7 +592,9 @@ def append_csv(metrics, checkpoint_path, visual_dir, args):
         'ssim_cb': f"{metrics['ssim_cb']:.6f}",
         'ssim_cr': f"{metrics['ssim_cr']:.6f}",
         'yuv_ssim_611': f"{metrics['yuv_ssim_611']:.6f}",
-        'lpips_alex': f"{metrics['lpips_alex']:.6f}",
+        'lpips_alex': optional_text('lpips_alex'),
+        'dists': optional_text('dists'),
+        'vmaf': optional_text('vmaf', digits=4),
         'frame_psnr_mean': f"{metrics['frame_psnr_mean']:.4f}",
         'frame_psnr_std': f"{metrics['frame_psnr_std']:.4f}",
         'frame_y_psnr_mean': f"{metrics['frame_y_psnr_mean']:.4f}",
@@ -622,18 +653,20 @@ def format_metrics(metrics, checkpoint_path):
 @torch.no_grad()
 def evaluate(model, dataloader, positional_encoding, device, checkpoint_path, epoch, args):
     model.eval()
-    sums = {'rgb': 0.0, 'y': 0.0, 'cb': 0.0, 'cr': 0.0}
-    counts = {'rgb': 0, 'y': 0, 'cb': 0, 'cr': 0}
-    ssim_sums = {'y': 0.0, 'cb': 0.0, 'cr': 0.0}
-    msssim_total = 0.0
-    lpips_total = 0.0
+    accumulator = SequenceMetricAccumulator()
+    lpips_values = []
+    dists_values = []
+    per_frame_rows = []
     frame_count = 0
-    frame_rgb_psnrs = []
-    frame_y_psnrs = []
-    rgb_errors_for_temporal = []
     benchmark_input = None
     visual_dir = os.path.join(args.out_dir, 'visuals')
+    prediction_dir = os.path.join(args.out_dir, 'predictions')
+    reference_dir = os.path.join(args.out_dir, 'references')
     lpips_model = build_lpips_model(device)
+    dists_model = build_dists_model(device)
+    if args.save_predictions or args.compute_vmaf:
+        os.makedirs(prediction_dir, exist_ok=True)
+        os.makedirs(reference_dir, exist_ok=True)
 
     for step, (rgb_target, norm_index) in enumerate(dataloader):
         if args.debug and step > 1:
@@ -642,30 +675,30 @@ def evaluate(model, dataloader, positional_encoding, device, checkpoint_path, ep
         embed_input = positional_encoding(norm_index).to(device, non_blocking=True)
         prediction = predict(model, embed_input, args)
         ycbcr_target = rgb_to_ycbcr_bt709(rgb_target)
-
-        rgb_error = prediction['rgb'] - rgb_target
-        ycbcr_error = prediction['ycbcr'] - ycbcr_target
-        sums['rgb'] += rgb_error.square().sum().item()
-        counts['rgb'] += rgb_error.numel()
-        for channel_index, channel_name in enumerate(['y', 'cb', 'cr']):
-            channel_error = ycbcr_error[:, channel_index:channel_index + 1]
-            sums[channel_name] += channel_error.square().sum().item()
-            counts[channel_name] += channel_error.numel()
-            ssim_sums[channel_name] += safe_ssim(
-                prediction['ycbcr'][:, channel_index:channel_index + 1],
-                ycbcr_target[:, channel_index:channel_index + 1],
-            ) * rgb_target.size(0)
-        frame_rgb_psnrs.extend(frame_psnr_values(rgb_error))
-        frame_y_psnrs.extend(frame_psnr_values(ycbcr_error[:, 0:1]))
-        for batch_index in range(rgb_error.size(0)):
-            rgb_errors_for_temporal.append(rgb_error[batch_index].detach().cpu())
-        msssim_total += safe_ms_ssim(prediction['rgb'], rgb_target) * rgb_target.size(0)
-        if lpips_model is not None:
-            pred_lpips = prediction['rgb'] * 2 - 1
-            target_lpips = rgb_target * 2 - 1
-            lpips_total += lpips_model(pred_lpips, target_lpips).mean().item() * rgb_target.size(0)
-        else:
-            lpips_total = float('nan')
+        accumulator.update(prediction['rgb'], rgb_target)
+        for batch_index in range(rgb_target.size(0)):
+            output_frame = prediction['rgb'][batch_index:batch_index + 1]
+            target_frame = rgb_target[batch_index:batch_index + 1]
+            lpips_value = evaluate_lpips(lpips_model, output_frame, target_frame)
+            dists_value = evaluate_dists(dists_model, output_frame, target_frame)
+            lpips_values.append(lpips_value)
+            dists_values.append(dists_value)
+            rgb_mse = F.mse_loss(output_frame, target_frame).item()
+            y_mse = F.mse_loss(
+                prediction['ycbcr'][batch_index:batch_index + 1, :1],
+                ycbcr_target[batch_index:batch_index + 1, :1],
+            ).item()
+            per_frame_rows.append({
+                'frame_index': frame_count + batch_index,
+                'rgb_psnr': psnr_from_mse(rgb_mse),
+                'y_psnr': psnr_from_mse(y_mse),
+                'lpips_alex': lpips_value,
+                'dists': dists_value,
+            })
+            if args.save_predictions or args.compute_vmaf:
+                filename = f'frame_{frame_count + batch_index:06d}.png'
+                save_image(output_frame[0], os.path.join(prediction_dir, filename))
+                save_image(target_frame[0], os.path.join(reference_dir, filename))
         save_visuals(prediction, rgb_target, ycbcr_target, visual_dir, frame_count, args)
         frame_count += rgb_target.size(0)
         benchmark_input = embed_input if benchmark_input is None else benchmark_input
@@ -673,54 +706,77 @@ def evaluate(model, dataloader, positional_encoding, device, checkpoint_path, ep
     if frame_count == 0:
         raise RuntimeError('Evaluation dataset is empty')
     model_fps, end_to_end_fps = benchmark_fps(model, benchmark_input, args, device)
-    estimated_gflops = estimate_model_gflops(model, benchmark_input, args)
-    psnr_y = calculate_psnr(sums['y'], counts['y'])
-    psnr_cb = calculate_psnr(sums['cb'], counts['cb'])
-    psnr_cr = calculate_psnr(sums['cr'], counts['cr'])
-    mse_y = sums['y'] / counts['y']
-    mse_cb = sums['cb'] / counts['cb']
-    mse_cr = sums['cr'] / counts['cr']
-    ssim_y = ssim_sums['y'] / frame_count
-    ssim_cb = ssim_sums['cb'] / frame_count
-    ssim_cr = ssim_sums['cr'] / frame_count
-    metrics = {
+    estimated_macs_g, estimated_gflops = estimate_model_macs_and_gflops(
+        model, benchmark_input, args)
+    metrics = accumulator.compute()
+    metrics.update({
         'epoch': epoch,
         'experiment': args.experiment,
         'params_M': sum(parameter.numel() for parameter in model.parameters()) / 1e6,
-        'rgb_psnr': calculate_psnr(sums['rgb'], counts['rgb']),
-        'rgb_ms_ssim': msssim_total / frame_count,
-        'psnr_y': psnr_y,
-        'psnr_cb': psnr_cb,
-        'psnr_cr': psnr_cr,
-        'yuv_psnr_611_dbavg': weighted_yuv_psnr_dbavg(psnr_y, psnr_cb, psnr_cr),
-        'yuv_psnr_611_mse': weighted_yuv_psnr_mse(mse_y, mse_cb, mse_cr),
-        'ssim_y': ssim_y,
-        'ssim_cb': ssim_cb,
-        'ssim_cr': ssim_cr,
-        'yuv_ssim_611': (6 * ssim_y + ssim_cb + ssim_cr) / 8,
-        'lpips_alex': lpips_total / frame_count if lpips_model is not None else float('nan'),
-        'frame_psnr_mean': float(np.mean(frame_rgb_psnrs)),
-        'frame_psnr_std': float(np.std(frame_rgb_psnrs)),
-        'frame_y_psnr_mean': float(np.mean(frame_y_psnrs)),
-        'frame_y_psnr_std': float(np.std(frame_y_psnrs)),
-        'temporal_rgb_error_diff': temporal_rgb_error_diff_from_errors(rgb_errors_for_temporal),
+        'lpips_alex': optional_metric_mean(lpips_values),
+        'dists': optional_metric_mean(dists_values),
         'model_fps': model_fps,
         'end_to_end_fps': end_to_end_fps,
+        'estimated_macs_g': estimated_macs_g,
         'estimated_gflops': estimated_gflops,
         'output_sample_ratio': representation_sample_ratio(args),
-    }
+        'frame_count': frame_count,
+        'checkpoint_policy': args.checkpoint_policy,
+    })
+    if args.compute_vmaf:
+        vmaf = compute_vmaf(
+            os.path.join(reference_dir, 'frame_%06d.png'),
+            os.path.join(prediction_dir, 'frame_%06d.png'),
+            os.path.join(args.out_dir, 'vmaf.json'),
+            os.path.join(args.out_dir, 'vmaf_command.txt'),
+            fps=args.vmaf_fps,
+            model_path=args.vmaf_model_path,
+        )
+        metrics['vmaf'] = vmaf['vmaf_score']
+        metrics['ffmpeg_version'] = vmaf['ffmpeg_version']
+        metrics['libvmaf_version'] = vmaf['libvmaf_version']
+    else:
+        metrics['vmaf'] = None
     text = format_metrics(metrics, checkpoint_path)
     print(text)
     with open(os.path.join(args.out_dir, 'eval.txt'), 'a') as eval_file:
         eval_file.write(text + '\n')
+    write_json(os.path.join(args.out_dir, 'eval_metrics.json'), metrics)
+    environment_path = os.path.join(args.out_dir, 'environment.json')
+    if os.path.isfile(environment_path):
+        manifest = read_json(environment_path)
+        manifest.update({
+            'model_macs': int(round(estimated_macs_g * 1e9)),
+            'model_gflops': estimated_gflops,
+            'model_fps': model_fps,
+            'end_to_end_fps': end_to_end_fps,
+            'evaluated_checkpoint': checkpoint_path,
+        })
+        write_json(environment_path, manifest)
+    with open(os.path.join(args.out_dir, 'per_frame_metrics.csv'), 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(per_frame_rows[0]))
+        writer.writeheader()
+        writer.writerows(per_frame_rows)
     append_csv(metrics, checkpoint_path, visual_dir, args)
     return metrics
 
 
 def build_dataloaders(args):
-    transform = transforms.ToTensor()
-    train_dataset = CustomDataSet(args.data_dir, transform, vid_list=args.vid, frame_gap=args.frame_gap)
-    val_dataset = CustomDataSet(args.data_dir, transform, vid_list=args.vid, frame_gap=args.test_gap)
+    if args.data_root:
+        if not args.sequence:
+            raise ValueError('--data_root requires exactly one --sequence per training run')
+        train_dataset = UVGSequenceDataset(
+            args.data_root, args.sequence, args.max_frames, args.frame_gap,
+            args.target_height, args.target_width, args.allow_resize)
+        val_dataset = UVGSequenceDataset(
+            args.data_root, args.sequence, args.max_frames, args.test_gap,
+            args.target_height, args.target_width, args.allow_resize)
+    else:
+        transform = transforms.ToTensor()
+        train_dataset = CustomDataSet(
+            args.data_dir, transform, vid_list=args.vid, frame_gap=args.frame_gap)
+        val_dataset = CustomDataSet(
+            args.data_dir, transform, vid_list=args.vid, frame_gap=args.test_gap)
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batchSize,
@@ -739,7 +795,7 @@ def build_dataloaders(args):
         drop_last=False,
         worker_init_fn=worker_init_fn,
     )
-    return train_loader, val_loader
+    return train_loader, val_loader, train_dataset, val_dataset
 
 
 def main():
@@ -748,16 +804,22 @@ def main():
         shutil.rmtree(args.out_dir)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    torch.manual_seed(args.manualSeed)
-    np.random.seed(args.manualSeed)
-    random.seed(args.manualSeed)
-    cudnn.benchmark = torch.cuda.is_available()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    benchmark = torch.cuda.is_available() and not args.cuda_deterministic
+    set_reproducibility(args.manualSeed, args.cuda_deterministic, benchmark)
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('--device cuda requested, but CUDA is unavailable')
+    device_name = (
+        'cuda' if args.device == 'cuda'
+        else 'cpu' if args.device == 'cpu'
+        else ('cuda' if torch.cuda.is_available() else 'cpu')
+    )
+    device = torch.device(device_name)
 
     positional_encoding = PositionalEncoding(args.embed)
     model = build_model(args, positional_encoding.embed_length).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(args.beta, 0.999))
     latest_path = os.path.join(args.out_dir, 'model_latest.pth')
+    final_path = os.path.join(args.out_dir, 'model_final.pth')
 
     checkpoint_path = args.weight
     if args.resume and checkpoint_path is None and os.path.isfile(latest_path):
@@ -775,7 +837,52 @@ def main():
     print(model)
     print(f'Device: {device}')
     print(f'Model params: {sum(parameter.numel() for parameter in model.parameters()) / 1e6:.6f}M')
-    train_loader, val_loader = build_dataloaders(args)
+    train_loader, val_loader, train_dataset, val_dataset = build_dataloaders(args)
+
+    if args.data_root:
+        config = (
+            read_json(args.job_config_json)
+            if args.job_config_json else vars(args).copy()
+        )
+        write_json(os.path.join(args.out_dir, 'config.json'), config)
+        with open(os.path.join(args.out_dir, 'command.txt'), 'w', encoding='utf-8') as handle:
+            handle.write(subprocess.list2cmdline([sys.executable] + sys.argv) + '\n')
+        with open(
+                os.path.join(args.out_dir, 'selected_frames.txt'),
+                'w',
+                encoding='utf-8') as handle:
+            handle.write('\n'.join(val_dataset.selected_frame_names) + '\n')
+        manifest = environment_info(os.path.dirname(os.path.abspath(__file__)))
+        manifest.update({
+            'seed': args.manualSeed,
+            'cuda_deterministic': args.cuda_deterministic,
+            'cudnn_benchmark': benchmark,
+            'sequence': args.sequence,
+            'selected_frame_count': len(val_dataset),
+            'selected_frame_filenames': val_dataset.selected_frame_names,
+            'source_resolution': list(val_dataset.source_resolution),
+            'target_resolution': list(val_dataset.target_resolution),
+            'parameter_count': sum(p.numel() for p in model.parameters() if p.requires_grad),
+            'checkpoint_policy': args.checkpoint_policy,
+            'model_arguments': model_kwargs(args, positional_encoding.embed_length),
+            'loss_weights': {
+                'lambda_y': args.lambda_y,
+                'lambda_c': args.lambda_c,
+                'lambda_rgb': args.lambda_rgb,
+            },
+        })
+        write_json(os.path.join(args.out_dir, 'environment.json'), manifest)
+        if args.rate_eval:
+            write_json(os.path.join(args.out_dir, 'rate_eval.json'), {
+                'available': False,
+                'reason': (
+                    'The local quantization path does not account for Huffman codebooks, '
+                    'tensor boundaries, shapes, scales, or zero-points. No paper-facing '
+                    'storage rate was approximated.'
+                ),
+                'embedding_bits': 0,
+                'requested_model_precision': 'M8',
+            })
 
     if args.eval_only:
         if checkpoint_path is None:
@@ -812,13 +919,16 @@ def main():
                 )
 
         save_checkpoint(latest_path, model, optimizer, epoch + 1, best_rgb_psnr, args)
+        if epoch + 1 == args.epochs:
+            save_checkpoint(final_path, model, optimizer, epoch + 1, best_rgb_psnr, args)
         if (epoch + 1) % args.eval_freq == 0 or epoch + 1 == args.epochs:
+            evaluation_checkpoint = final_path if epoch + 1 == args.epochs else latest_path
             metrics = evaluate(
                 model,
                 val_loader,
                 positional_encoding,
                 device,
-                latest_path,
+                evaluation_checkpoint,
                 epoch + 1,
                 args,
             )
@@ -832,7 +942,45 @@ def main():
                     best_rgb_psnr,
                     args,
                 )
+                save_checkpoint(
+                    os.path.join(args.out_dir, 'model_best.pth'),
+                    model,
+                    optimizer,
+                    epoch + 1,
+                    best_rgb_psnr,
+                    args,
+                )
                 save_checkpoint(latest_path, model, optimizer, epoch + 1, best_rgb_psnr, args)
+
+    metrics_path = os.path.join(args.out_dir, 'eval_metrics.json')
+    if not os.path.isfile(metrics_path):
+        if not os.path.isfile(final_path):
+            save_checkpoint(final_path, model, optimizer, args.epochs, best_rgb_psnr, args)
+        evaluate(
+            model,
+            val_loader,
+            positional_encoding,
+            device,
+            final_path,
+            args.epochs,
+            args,
+        )
+
+    if args.checkpoint_policy == 'best':
+        best_path = os.path.join(args.out_dir, 'model_best.pth')
+        if not os.path.isfile(best_path):
+            save_checkpoint(
+                best_path, model, optimizer, args.epochs, best_rgb_psnr, args)
+        load_checkpoint(best_path, model)
+        evaluate(
+            model,
+            val_loader,
+            positional_encoding,
+            device,
+            best_path,
+            args.epochs,
+            args,
+        )
 
 
 if __name__ == '__main__':
