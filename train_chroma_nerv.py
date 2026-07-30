@@ -51,6 +51,11 @@ from nerv_generalization import (
     set_reproducibility,
     write_json,
 )
+from persistence import (
+    atomic_write_json,
+    persist_resume_checkpoint,
+    retry_operation,
+)
 from utils import (
     PositionalEncoding,
     adjust_lr,
@@ -233,6 +238,10 @@ def parse_args():
     parser.add_argument('--rate_eval', action='store_true')
     parser.add_argument('--checkpoint_policy', choices=['final', 'best'], default='final')
     parser.add_argument('--job_config_json', default=None)
+    parser.add_argument('--persistent_run_dir', default=None)
+    parser.add_argument('--persist_checkpoint_interval', type=int, default=0)
+    parser.add_argument('--persistence_retries', type=int, default=3)
+    parser.add_argument('--persistence_retry_delay', type=float, default=10)
     parser.add_argument('--visual_frames', type=int, default=1)
     parser.add_argument('--weight', default=None, type=str)
     parser.add_argument('--resume', action='store_true')
@@ -919,6 +928,37 @@ def main():
                 )
 
         save_checkpoint(latest_path, model, optimizer, epoch + 1, best_rgb_psnr, args)
+        if (
+                args.persistent_run_dir
+                and args.persist_checkpoint_interval > 0
+                and (epoch + 1) % args.persist_checkpoint_interval == 0):
+            try:
+                retry_operation(
+                    lambda: persist_resume_checkpoint(
+                        args.out_dir,
+                        args.persistent_run_dir,
+                        read_json(os.path.join(args.out_dir, 'config.json')),
+                        epoch + 1,
+                    ),
+                    retries=args.persistence_retries,
+                    retry_delay=args.persistence_retry_delay,
+                    on_retry=lambda attempt, exc: print(
+                        f'Persistence retry {attempt}: {exc}', flush=True),
+                )
+                pending_path = os.path.join(args.out_dir, 'persistence_pending.json')
+                if os.path.isfile(pending_path):
+                    os.remove(pending_path)
+            except Exception as exc:
+                print(f'Periodic checkpoint persistence failed: {exc}', flush=True)
+                atomic_write_json(
+                    os.path.join(args.out_dir, 'persistence_pending.json'),
+                    {
+                        'status': 'pending',
+                        'stage': 'periodic_checkpoint',
+                        'epoch': epoch + 1,
+                        'error': str(exc),
+                    },
+                )
         if epoch + 1 == args.epochs:
             save_checkpoint(final_path, model, optimizer, epoch + 1, best_rgb_psnr, args)
         if (epoch + 1) % args.eval_freq == 0 or epoch + 1 == args.epochs:

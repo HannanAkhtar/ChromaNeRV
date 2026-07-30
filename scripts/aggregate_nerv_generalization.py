@@ -11,6 +11,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from nerv_generalization import DEFAULT_CONFIGS, UVG_SEQUENCES  # noqa: E402
+from persistence import (  # noqa: E402
+    atomic_copy_directory_files,
+    read_json,
+    validate_persistent_run,
+)
 
 
 METRICS = (
@@ -24,8 +29,28 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Aggregate NeRV UVG7 generalization results')
     parser.add_argument('--results_root', default='output/nerv_generalization')
     parser.add_argument('--output_dir', default='results/nerv_generalization')
+    parser.add_argument('--persistent_root', default=None)
     parser.add_argument('--allow_partial', action='store_true')
     return parser.parse_args()
+
+
+def load_result(results_root, persistent_root, sequence, config):
+    local_path = Path(results_root) / sequence / config / 'eval_metrics.json'
+    if local_path.is_file():
+        row = read_json(local_path)
+        row['result_source'] = 'local'
+        return row
+    if persistent_root:
+        persistent_run = Path(persistent_root) / 'runs' / sequence / config
+        valid, reason = validate_persistent_run(persistent_run)
+        if (persistent_run / 'completion.json').exists() and not valid:
+            raise RuntimeError(
+                f'Invalid persistent result {sequence}/{config}: {reason}')
+        if valid:
+            row = read_json(persistent_run / 'eval_metrics.json')
+            row['result_source'] = 'persistent'
+            return row
+    return None
 
 
 def write_csv(path, rows, fields=None):
@@ -91,16 +116,15 @@ def main():
     args = parse_args()
     root = Path(args.results_root)
     output_dir = Path(args.output_dir)
+    persistent_root = Path(args.persistent_root).resolve() if args.persistent_root else None
     rows = []
     missing = []
     for sequence in UVG_SEQUENCES:
         for config in DEFAULT_CONFIGS:
-            path = root / sequence / config / 'eval_metrics.json'
-            if not path.exists():
+            row = load_result(root, persistent_root, sequence, config)
+            if row is None:
                 missing.append(f'{sequence}/{config}')
                 continue
-            with path.open('r', encoding='utf-8') as handle:
-                row = json.load(handle)
             row.update({'sequence': sequence, 'config_name': config})
             rows.append(row)
     if missing and not args.allow_partial:
@@ -139,6 +163,8 @@ def main():
     write_csv(output_dir / 'full_rgb_deltas.csv', full_deltas)
 
     pooled_path = root / 'manifests' / 'pooled_fid.json'
+    if not pooled_path.exists() and persistent_root:
+        pooled_path = persistent_root / 'manifests' / 'pooled_fid.json'
     pooled = json.loads(pooled_path.read_text(encoding='utf-8')) if pooled_path.exists() else []
     write_csv(output_dir / 'pooled_fid.csv', pooled, ['config_name', 'fid', 'pooled_frame_count'])
     write_csv(
@@ -183,6 +209,8 @@ def main():
             plt.close()
     except ImportError:
         print('matplotlib unavailable; plot generation skipped')
+    if persistent_root:
+        atomic_copy_directory_files(output_dir, persistent_root / 'results')
 
 
 if __name__ == '__main__':

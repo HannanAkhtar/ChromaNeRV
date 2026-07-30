@@ -87,6 +87,52 @@ The local legacy quantization path does not encode all codebook, shape, scale,
 zero-point, and tensor-boundary overhead. `--rate_eval` therefore records rate
 and BD-rate as unavailable rather than emitting an incompatible estimate.
 
+## Automatic Persistence
+
+`--output_root` is the local working root. It contains active checkpoints,
+logs, caches, predictions, references, and temporary FID/VMAF inputs.
+`--persistent_root` is the durable OneDrive root. It contains atomic copies of
+manifests, final and best checkpoints, logs, metrics, frame lists, completion
+markers, pooled FID, and aggregation results.
+
+Predictions and references are local-only by default. Use
+`--persist_predictions` only when their additional OneDrive storage cost is
+intentional. The default `--persist_checkpoint_interval 10` copies a resumable
+`model_latest.pth` every ten epochs. Set it to zero to disable intermediate
+persistence.
+
+Every durable write first targets `filename.tmp` in the destination directory,
+is flushed and verified, and then replaces the destination with `os.replace`.
+Checkpoint copies are size- and SHA-256-verified. `completion.json` is written
+last and records the scientific configuration hash, selected checkpoint hash,
+metrics hash, paths, and required artifacts. A persistent directory is never
+treated as complete merely because it exists.
+
+After an RDP disconnection, rerun the same command with `--resume`; a matching
+local checkpoint is resumed and pending persistence is retried first. After
+DeepFreeze or local disk loss, the launcher validates the persistent completion
+marker and skips completed training. A valid periodic checkpoint is restored
+when the run was not complete. If pooled-FID PNGs were not persisted, evaluation
+is run automatically from the restored final checkpoint to regenerate them
+locally. They are deleted after FID unless `--keep_predictions` is supplied.
+
+Persistence retries default to three attempts with ten seconds between attempts.
+After final failure, local data remains untouched and
+`persistence_pending.json` is written. The launcher stops before the next job
+unless `--continue_on_persistence_failure` is explicitly selected.
+
+The persistent layout is:
+
+```text
+persistent_root/
+  manifests/
+  runs/<sequence>/<config>/
+  results/
+```
+
+Omitting `--persistent_root` preserves the old local-only behavior and prints a
+warning.
+
 ## Commands
 
 Environment:
@@ -97,26 +143,55 @@ python scripts/check_nerv_generalization_environment.py
 
 Dry run:
 
-```bash
-python scripts/run_nerv_generalization.py --data_root /path/to/UVG_extracted --output_root output/nerv_generalization --dry_run
+```bat
+python scripts\run_nerv_generalization.py ^
+  --data_root "C:\Users\b00101092\Documents\Chroma\UVG_extracted" ^
+  --output_root "C:\Users\b00101092\Documents\Chroma\runs\nerv_generalization" ^
+  --persistent_root "C:\Users\b00101092\OneDrive - aus.edu\persistent_storage\nerv_generalization" ^
+  --dry_run
 ```
 
 Smoke test:
 
-```bash
-python scripts/run_nerv_generalization.py --data_root /path/to/UVG_extracted --output_root output/nerv_generalization_smoke --sequences Beauty --configs full_rgb,full_ycbcr444,rgbsplit_w8,chroma_w8 --max_frames 2 --epochs 1 --smoke_test --skip_vmaf --skip_fid
+```bat
+python scripts\run_nerv_generalization.py ^
+  --data_root "C:\Users\b00101092\Documents\Chroma\UVG_extracted" ^
+  --output_root "C:\Users\b00101092\Documents\Chroma\runs\nerv_generalization_smoke" ^
+  --persistent_root "C:\Users\b00101092\OneDrive - aus.edu\persistent_storage\nerv_generalization_smoke" ^
+  --sequences Beauty ^
+  --configs full_rgb,chroma_w8 ^
+  --max_frames 2 ^
+  --epochs 1 ^
+  --smoke_test ^
+  --skip_vmaf ^
+  --skip_fid
 ```
 
 One sequence:
 
-```bash
-python scripts/run_nerv_generalization.py --data_root /path/to/UVG_extracted --output_root output/nerv_generalization --sequences Beauty --configs full_rgb,full_ycbcr444,rgbsplit_w8,chroma_w8,rgbsplit_w4,chroma_w4 --max_frames 132 --epochs 300 --resume
+```bat
+python scripts\run_nerv_generalization.py ^
+  --data_root "C:\Users\b00101092\Documents\Chroma\UVG_extracted" ^
+  --output_root "C:\Users\b00101092\Documents\Chroma\runs\nerv_generalization" ^
+  --persistent_root "C:\Users\b00101092\OneDrive - aus.edu\persistent_storage\nerv_generalization" ^
+  --sequences Beauty ^
+  --max_frames 132 ^
+  --epochs 300 ^
+  --checkpoint_policy final ^
+  --resume
 ```
 
 Full UVG7:
 
-```bash
-python scripts/run_nerv_generalization.py --data_root /path/to/UVG_extracted --output_root output/nerv_generalization --max_frames 132 --epochs 300 --resume
+```bat
+python scripts\run_nerv_generalization.py ^
+  --data_root "C:\Users\b00101092\Documents\Chroma\UVG_extracted" ^
+  --output_root "C:\Users\b00101092\Documents\Chroma\runs\nerv_generalization" ^
+  --persistent_root "C:\Users\b00101092\OneDrive - aus.edu\persistent_storage\nerv_generalization" ^
+  --max_frames 132 ^
+  --epochs 300 ^
+  --checkpoint_policy final ^
+  --resume
 ```
 
 Evaluation-only:
@@ -127,6 +202,15 @@ python scripts/run_nerv_generalization.py --data_root /path/to/UVG_extracted --o
 
 Aggregation:
 
-```bash
-python scripts/aggregate_nerv_generalization.py --results_root output/nerv_generalization
+```bat
+python scripts\aggregate_nerv_generalization.py ^
+  --results_root "C:\Users\b00101092\Documents\Chroma\runs\nerv_generalization" ^
+  --persistent_root "C:\Users\b00101092\OneDrive - aus.edu\persistent_storage\nerv_generalization"
+```
+
+Persistence validation is performed automatically at launcher startup and
+before every skip or restore decision. It can also be exercised with:
+
+```bat
+python -m unittest tests.test_nerv_persistence -v
 ```
