@@ -1,0 +1,8 @@
+{
+  "aggregation": "equal weight per sequence across Bunny and UVG7",
+  "complete": false,
+  "expected_jobs": 48,
+  "included_jobs": 0,
+  "missing_jobs": "all 48 sequence/configuration runs",
+  "note": "No complete final result source was present in the audited checkout. Empty schema-only CSVs are included to avoid fabricating measurements. Regenerate them with the aggregation script after completing all runs."
+}

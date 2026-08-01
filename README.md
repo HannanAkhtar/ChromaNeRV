@@ -1,135 +1,146 @@
-# NeRV: Neural Representations for Videos  (NeurIPS 2021)
-### [Project Page](https://haochen-rye.github.io/NeRV) | [Paper](https://arxiv.org/abs/2110.13903) | [UVG Data](http://ultravideo.fi/#testsequences) 
+# ChromaNeRV: NeRV Generalization Supplement
 
+## Anonymous supplementary-code notice
 
-[Hao Chen](https://haochen-rye.github.io),
-Bo He,
-Hanyu Wang,
-Yixuan Ren,
-Ser-Nam Lim],
-[Abhinav Shrivastava](https://www.cs.umd.edu/~abhinav/)<br>
-This is the official implementation of the paper "NeRV: Neural Representations for Videos ".
+This anonymous repository accompanies the paper *ChromaNeRV: Luma-Chroma Capacity Allocation for Efficient Neural Video Representation*. It contains only the NeRV generalization experiments. The main-paper HNeRV training pipeline, model budgets, quantization experiments, rate-distortion curves, and BD-rate results are not included.
 
-## 🔥 A better codebase is released based on [HNeRV](https://github.com/haochen-rye/HNeRV).
+## Overview
 
-## Method overview
-<img src="https://i.imgur.com/OTdHe6r.png" width="560"  />
+The release compares six independently trained NeRV decoders on Bunny and seven UVG sequences. Each model uses the first 132 frames, seed 1, 300 epochs, batch size 1, and final-checkpoint evaluation. Final quality averages give equal weight to all eight videos.
 
-## Get started
-We run with Python 3.8, you can set up a conda environment with all dependencies like so:
-```
-pip install -r requirements.txt 
-```
+## NeRV ChromaNeRV method
 
-### Modern Windows CUDA setup
+ChromaNeRV retains a shared NeRV trunk, then uses a narrow full-resolution Y branch and a half-resolution CbCr head. Chroma targets use area downsampling; predicted chroma uses bilinear upsampling before inverse full-range BT.709 conversion to RGB.
 
-The original `requirements.txt` preserves the 2021 dependency pins. For current Windows
-systems, create a Python 3.12 virtual environment and install a CUDA-enabled PyTorch wheel
-from the [official selector](https://pytorch.org/get-started/locally/) before installing the
-compatible unpinned support packages:
+## Experimental configurations
 
-```
-python -m venv .venv
-.\.venv\Scripts\python -m pip install --upgrade pip
-.\.venv\Scripts\python -m pip install -r requirements-modern.txt
-.\.venv\Scripts\python -c "import torch, torchvision; print(torch.__version__, torchvision.__version__, torch.cuda.is_available())"
+`full_rgb` is the standard RGB decoder. `full_ycbcr444` has the same architecture and computational path but predicts full-resolution YCbCr as a color-space control. `rgbsplit_w8` and `rgbsplit_w4` restrict the final high-resolution RGB pathway. `chroma_w8` and `chroma_w4` use the luma-chroma allocation above with branch width 8 or 4.
+
+## Repository structure
+
+Core model and training code is at the root. Machine-readable protocols are in `configs/supplementary`, entry points are in `scripts`, shared metrics are in `metrics`, tiny test data is in `tests/fixtures`, and sanitized result metadata is in `results/supplementary`.
+
+## Installation
+
+The reference environment is Python 3.10, PyTorch 2.5.1, torchvision 0.20.1, and a CUDA 12.4-compatible PyTorch build. Install PyTorch for the target CPU/CUDA platform, then install the remaining dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+python scripts/validate_release.py --check_environment
 ```
 
-Verified on this checkout with Python `3.12.3`, PyTorch `2.7.1+cu118`,
-torchvision `0.22.1+cu118`, NumPy `2.4.6`, Pillow `12.2.0`, and
-`pytorch_msssim 1.0.0`. CUDA was verified on an NVIDIA GeForce RTX 3050
-Laptop GPU.
+Conda users may instead use `conda env create -f environment.yml`.
 
-## ChromaNeRV Stage 1: BT.709 Y'CbCr 4:4:4
+## Optional metric dependencies
 
-Stage 1 adds an architecture-matched full-resolution BT.709 Y'CbCr ablation. RGB remains
-the default and preserves the original behavior. Add `--color_space ycbcr` to train the same
-three-channel generator in normalized full-range Y'CbCr space. Evaluation and dumped images
-are converted back to RGB, and evaluation logs include RGB PSNR, PSNR-Y, RGB MS-SSIM,
-parameter count, and decoding FPS.
+LPIPS, DISTS, FID/KID, FFmpeg with libvmaf, plotting, and Excel export are optional. Core imports do not require them. Install only the packages needed for the selected metrics; unavailable optional metrics report an actionable error or remain absent from output.
 
-Run the color conversion tests with:
+## Dataset preparation
 
-```
-.\.venv\Scripts\python -m unittest discover -s tests -v
+Datasets are not distributed. Bunny may contain frames directly; UVG uses sequence subdirectories:
+
+```text
+data/bunny/000000.png
+data/uvg/Beauty/000000.png
+data/uvg/Bosphorus/000000.png
+... HoneyBee, Jockey, ReadySetGo, ShakeNDry, YachtRide
 ```
 
-## High-Level structure
-The code is organized as follows:
-* [train_nerv.py](./train_nerv.py) includes a generic traiing routine.
-* [model_nerv.py](./model_nerv.py) contains the dataloader and neural network architecure 
-* [data/](./data) directory video/imae dataset, we provide big buck bunny here
-* [checkpoints/](./checkpoints) directory contains some pre-trained model on big buck bunny dataset
-* log files (tensorboard, txt, state_dict etc.) will be saved in output directory (specified by ```--outf```)
+Accepted suffixes are PNG, JPG/JPEG, BMP, TIFF, and WebP. Frames are naturally sorted by filename and the first 132 are selected. Paper runs require at least 132 frames. Bunny targets 720x1280 without resizing. UVG targets 960x1920 using a deterministic vertical center crop from 1080x1920. Normal runs never resize implicitly; `--allow_resize` is for smoke/debug use only.
 
-## Reproducing experiments
+## Dataset validation
 
-### Training experiments
-The NeRV-S experiment on 'big buck bunny' can be reproduced with, NeRV-M and NeRV-L with ```9_16_58``` and ```9_16_112``` for ```fc_hw_dim``` respectively.
-```
-python train_nerv.py -e 300   --lower-width 96 --num-blocks 1 --dataset bunny --frame_gap 1 \
-    --outf bunny_ab --embed 1.25_40 --stem_dim_num 512_1  --reduction 2  --fc_hw_dim 9_16_26 --expansion 1  \
-    --single_res --loss Fusion6   --warmup 0.2 --lr_type cosine  --strides 5 2 2 2 2  --conv_type conv \
-    -b 1  --lr 0.0005 --norm none --act swish 
+```bash
+python scripts/validate_release.py --check_data --bunny_root /path/to/bunny --uvg_root /path/to/uvg
 ```
 
-### Evaluation experiments
-To evaluate pre-trained model, just add --eval_Only and specify model path with --weight, you can specify model quantization with ```--quant_bit [bit_lenght]```, yuo can test decoding speed with ```--eval_fps```, below we preovide sample commends for NeRV-S on bunny dataset
-```
-python train_nerv.py -e 300   --lower-width 96 --num-blocks 1 --dataset bunny --frame_gap 1 \
-    --outf bunny_ab --embed 1.25_40 --stem_dim_num 512_1  --reduction 2  --fc_hw_dim 9_16_26 --expansion 1  \
-    --single_res --loss Fusion6   --warmup 0.2 --lr_type cosine  --strides 5 2 2 2 2  --conv_type conv \
-    -b 1  --lr 0.0005 --norm none  --act swish \
-    --weight checkpoints/nerv_S.pth --eval_only 
+The validator prints sequence discovery, selected count, first/last frame, source and target resolution, and preprocessing.
+
+## Quick CPU smoke test
+
+```bash
+python scripts/run_nerv_generalization.py --config configs/supplementary/smoke_test.json --data_root tests/fixtures/tiny_video --output_root output/smoke_test --device cpu --smoke_test --skip_vmaf --skip_fid
 ```
 
-### Decoding: Dump predictions with pre-trained model 
-To dump predictions with pre-trained model, just add ```--dump_images``` besides ```--eval_Only``` and specify model path with ```--weight```
-```
-python train_nerv.py -e 300   --lower-width 96 --num-blocks 1 --dataset bunny --frame_gap 1 \
-    --outf bunny_ab --embed 1.25_40 --stem_dim_num 512_1  --reduction 2  --fc_hw_dim 9_16_26 --expansion 1  \
-    --single_res --loss Fusion6   --warmup 0.2 --lr_type cosine  --strides 5 2 2 2 2  --conv_type conv \
-    -b 1  --lr 0.0005 --norm none  --act swish \
-   --weight checkpoints/nerv_S.pth --eval_only  --dump_images
+The tiny grid exercises RGB, YCbCr444, RGBSplit, ChromaNeRV, training, checkpointing, and metric serialization. Use the evaluation-only command below to verify checkpoint reload.
+
+## Reproducing Bunny experiments
+
+```bash
+python scripts/run_bunny_experiments.py --config configs/supplementary/nerv_bunny.json --data_root /path/to/bunny --output_root output/nerv_bunny --device cuda --resume
 ```
 
-## Model Pruning
+This schedules 1 sequence x 6 configurations. The supplied Bunny protocol uses `(lambda_y, lambda_c, lambda_rgb)=(1,3,0.1)` for ChromaNeRV; no completed Bunny config was available in the local checkout to independently confirm the chroma weight.
 
-### Evaluate the pruned model
-Prune a pre-trained model and fine-tune to recover its performance, with ```--prune_ratio``` to specify model parameter amount to be pruned, ```--weight``` to specify the pre-trained model, ```--not_resume_epoch``` to skip loading the pre-trained weights epoch to restart fine-tune
-```
-python train_nerv.py -e 100   --lower-width 96 --num-blocks 1 --dataset bunny --frame_gap 1 \
-    --outf prune_ab --embed 1.25_40 --stem_dim_num 512_1  --reduction 2  --fc_hw_dim 9_16_26 --expansion 1  \
-    --single_res --loss Fusion6   --warmup 0. --lr_type cosine  --strides 5 2 2 2 2  --conv_type conv \
-    -b 1  --lr 0.0005 --norm none --suffix 107  --act swish \
-    --weight checkpoints/nerv_S.pth --not_resume_epoch --prune_ratio 0.4 
+## Reproducing UVG7 experiments
+
+```bash
+python scripts/run_nerv_generalization.py --config configs/supplementary/nerv_uvg7.json --data_root /path/to/uvg --output_root output/nerv_uvg7 --device cuda --resume
 ```
 
-### Evaluate the pruned model
-To evaluate pruned model, using ```--weight``` to specify the pruned model weight, ```--prune_ratio``` to initialize the ```weight_mask``` for checkpoint loading, ```eval_only``` for evaluation mode, ```--quant_bit``` to specify quantization bit length, ```--quant_axis``` to specify quantization axis
-```
-python train_nerv.py -e 100   --lower-width 96 --num-blocks 1 --dataset bunny --frame_gap 1 \
-    --outf dbg --embed 1.25_40 --stem_dim_num 512_1  --reduction 2  --fc_hw_dim 9_16_26 --expansion 1  \
-    --single_res --loss Fusion6   --warmup 0. --lr_type cosine  --strides 5 2 2 2 2  --conv_type conv \
-    -b 1  --lr 0.0005 --norm none --suffix 107  --act swish \
-    --weight checkpoints/nerv_S_pruned.pth --prune_ratio 0.4  --eval_only --quant_bit 8 --quant_axis 0
+This schedules 7 sequences x 6 configurations. UVG ChromaNeRV uses `(1,1,0.1)`.
 
+## Running a selected sequence/configuration
+
+```bash
+python scripts/run_nerv_generalization.py --config configs/supplementary/nerv_uvg7.json --data_root /path/to/uvg --output_root output/nerv_uvg7 --sequences Beauty --configs chroma_w8 --device cuda
 ```
 
-### Distrotion-Compression result
-The final bits-per-pixel (bpp) is computed by $$ModelParameter * (1 - ModelSparsity) * QuantBit / PixelNum$$.
-* We provide numerical results for distortion-compression for UVG and MCL at [this csv file](./checkpoints/psnr_bpp_results.csv) in ./checkpoints.
+Add `--dry_run` to inspect the resolved grid without training. Existing scientifically mismatched run configs are rejected.
 
-## Citation
-If you find our work useful in your research, please cite:
+## Evaluation-only workflow
+
+```bash
+python scripts/evaluate_checkpoint.py --config output/nerv_uvg7/Beauty/chroma_w8/config.json --checkpoint output/nerv_uvg7/Beauty/chroma_w8/model_final.pth --data_root /path/to/uvg --output_root output/evaluation --device cuda
 ```
-@InProceedings{chen2021nerv,
-      title={Ne{RV}: Neural Representations for Videos}, 
-      author={Hao Chen and Bo He and Hanyu Wang and Yixuan Ren and Ser-Nam Lim and Abhinav Shrivastava},
-      year={2021},
-    booktitle={NeurIPS},
+
+This entry point uses the training runner's metric implementations. Higher is better for PSNR, SSIM, VMAF, and VMAF-NEG. Lower is better for LPIPS, DISTS, temporal error, FID, and KID. FID/KID are secondary distributional measures; FPS is hardware-dependent; parameters and GFLOPs are architecture measurements.
+
+## Aggregating Bunny and UVG7
+
+```bash
+python scripts/aggregate_supplementary_results.py --bunny_root output/nerv_bunny --uvg_root output/nerv_uvg7 --output_root results/supplementary
+```
+
+The command requires 48 unique jobs and averages sequence-level quality metrics equally over Bunny and UVG7. Pooled distributional metrics must be reported separately and are not arithmetic per-sequence averages.
+
+## Reproducing supplementary tables
+
+Aggregation writes full-precision CSVs and rounded LaTeX files for absolute results, matched ChromaNeRV-minus-RGBSplit controls, per-sequence controls, and Full-YCbCr444-minus-Full-RGB controls. No NeRV RD or BD-rate table is generated.
+
+## Output files and directory structure
+
+Each run writes `config.json`, commands and environment metadata, logs, final checkpoint, `eval_metrics.json`, `per_frame_metrics.csv`, and optional prediction/reference images. Grid manifests live under the selected output root. Local output works without persistent storage.
+
+## Reference results for sanity checking
+
+The local checkout did not contain the complete final 48-run result set, so this release does not invent numerical rows. `results/supplementary/manifest.json` records that limitation. The protocol notes supplied for release preparation suggest W8 should substantially reduce compute with small weighted-YUV and VMAF changes, and should usually outperform matched RGBSplit-W8; these are expectations to check against reproduced outputs, not bundled measurements.
+
+## Reproducibility notes
+
+Configs preserve separate Bunny and UVG spatial presets, architecture, frame selection, losses, optimizer, cosine schedule, warm-up, seed, and final-checkpoint policy. RGB conversion is full-range BT.709. A model is trained separately for every sequence/configuration pair.
+
+## Known limitations
+
+Datasets and checkpoints are excluded. Optional perceptual metrics can vary with dependency versions; VMAF requires an FFmpeg build with libvmaf. Pooled UVG7 FID/KID requires retained images. CPU/GPU timing is not portable. This repository provides no NeRV rate experiment or main-paper rate claim.
+
+## Upstream NeRV attribution
+
+This work is derived from the original NeRV implementation and paper, *NeRV: Neural Representations for Videos*. See `THIRD_PARTY_NOTICES.md` for attribution and dependency notices.
+
+## Citation placeholder
+
+```bibtex
+@inproceedings{anonymous2027chromanerv,
+  title={ChromaNeRV: Luma--Chroma Capacity Allocation for Efficient Neural Video Representation},
+  author={Anonymous},
+  booktitle={Under Review},
+  year={2027}
 }
 ```
 
-## Contact
-If you have any questions, please feel free to email the author at haochen.umd@gmail.com.
+Please cite the upstream NeRV paper separately when using its implementation.
+
+## License
+
+The supplementary modifications are released under the MIT License in `LICENSE`. Third-party components remain subject to their own terms; see `THIRD_PARTY_NOTICES.md`.

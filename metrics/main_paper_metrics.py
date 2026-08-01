@@ -198,6 +198,38 @@ def compute_pooled_fid(reference_paths, reconstructed_paths, device='cpu', batch
     return float(metric.compute().item())
 
 
+def compute_pooled_kid(reference_paths, reconstructed_paths, device='cpu', batch_size=16):
+    """Compute KID mean over paired image sets using torchmetrics."""
+    if len(reference_paths) != len(reconstructed_paths):
+        raise ValueError('KID reference and reconstruction sets must have equal sizes')
+    if len(reference_paths) < 2:
+        raise ValueError('KID requires at least two image pairs')
+    try:
+        from PIL import Image
+        from torchmetrics.image.kid import KernelInceptionDistance
+        from torchvision.transforms.functional import to_tensor
+    except Exception as exc:
+        raise RuntimeError(
+            'KID requires torchmetrics[image], torch-fidelity, Pillow, and torchvision.'
+        ) from exc
+    subset_size = min(50, len(reference_paths))
+    metric = KernelInceptionDistance(
+        feature=2048, subset_size=subset_size, normalize=True).to(device)
+    for start in range(0, len(reference_paths), batch_size):
+        reference = torch.stack([
+            to_tensor(Image.open(path).convert('RGB'))
+            for path in reference_paths[start:start + batch_size]
+        ]).to(device)
+        reconstructed = torch.stack([
+            to_tensor(Image.open(path).convert('RGB'))
+            for path in reconstructed_paths[start:start + batch_size]
+        ]).to(device)
+        metric.update(reference, real=True)
+        metric.update(reconstructed, real=False)
+    mean, standard_deviation = metric.compute()
+    return {'kid_mean': float(mean.item()), 'kid_std': float(standard_deviation.item())}
+
+
 class SequenceMetricAccumulator:
     """Accumulate the main paper sequence metrics without retaining full videos."""
 

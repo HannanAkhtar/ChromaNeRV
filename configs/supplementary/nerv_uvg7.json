@@ -1,0 +1,26 @@
+{
+  "protocol": "NeRV UVG7 supplementary generalization",
+  "sequences": ["Beauty", "Bosphorus", "HoneyBee", "Jockey", "ReadySetGo", "ShakeNDry", "YachtRide"],
+  "configs": ["full_rgb", "full_ycbcr444", "rgbsplit_w8", "chroma_w8", "rgbsplit_w4", "chroma_w4"],
+  "configuration_map": {
+    "full_rgb": {"experiment": "rgb444", "color_space": "rgb", "branch_width": null},
+    "full_ycbcr444": {"experiment": "ycbcr444", "color_space": "ycbcr", "branch_width": null},
+    "rgbsplit_w8": {"experiment": "rgb_asym", "color_space": "rgb", "branch_width": 8},
+    "chroma_w8": {"experiment": "neural420_asym_y", "color_space": "ycbcr", "branch_width": 8},
+    "rgbsplit_w4": {"experiment": "rgb_asym", "color_space": "rgb", "branch_width": 4},
+    "chroma_w4": {"experiment": "neural420_asym_y", "color_space": "ycbcr", "branch_width": 4}
+  },
+  "max_frames": 132,
+  "source_resolution": [1080, 1920],
+  "target_resolution": [960, 1920],
+  "preprocessing": {"mode": "center_crop", "top": 60, "left": 0, "height": 960, "width": 1920, "resize_applied": false},
+  "architecture": {"embed": "1.25_40", "stem_dim_num": "512_1", "fc_hw_dim": "8_16_26", "expansion": 1.0, "reduction": 2, "lower_width": 96, "num_blocks": 1, "norm": "none", "act": "swish", "conv_type": "conv", "strides": [5, 3, 2, 2, 2], "single_res": true},
+  "branch_widths": [8, 4],
+  "color_conversion": "full-range BT.709",
+  "chroma_downsample": "area",
+  "chroma_upsample": "bilinear_align_corners_false",
+  "loss_weights": {"lambda_y": 1.0, "lambda_c": 1.0, "lambda_rgb": 0.1},
+  "training": {"epochs": 300, "batch_size": 1, "optimizer": "Adam", "learning_rate": 0.0005, "betas": [0.5, 0.999], "weight_decay": 0.0, "scheduler": "cosine", "warmup_ratio": 0.2, "seed": 1},
+  "checkpoint_policy": "final",
+  "metrics": ["rgb_psnr", "rgb_ms_ssim", "psnr_y", "psnr_cb", "psnr_cr", "yuv_psnr_611_mse", "yuv_ssim_611", "lpips_alex", "dists", "vmaf", "vmaf_neg", "temporal_rgb_error_diff", "fid", "kid", "parameters", "gflops", "gflops_per_output_megapixel", "model_fps", "end_to_end_fps"]
+}

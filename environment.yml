@@ -1,0 +1,19 @@
+name: chromanerv-nerv-supplementary
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.5.1
+  - torchvision=0.20.1
+  - pytorch-cuda=12.4
+  - numpy>=1.23
+  - pillow>=9.5
+  - pandas>=1.5
+  - scipy>=1.9
+  - scikit-image>=0.20
+  - tqdm>=4.64
+  - pip
+  - pip:
+      - pytorch-msssim>=0.2.1
