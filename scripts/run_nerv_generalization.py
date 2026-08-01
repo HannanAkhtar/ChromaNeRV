@@ -41,14 +41,15 @@ from persistence import (  # noqa: E402
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run the NeRV UVG7 generalization grid')
+    parser.add_argument('--config', default=None, help='Supplementary experiment JSON config')
     parser.add_argument('--data_root', required=True)
     parser.add_argument('--output_root', default='output/nerv_generalization')
     parser.add_argument('--persistent_root', default=None)
-    parser.add_argument('--sequences', default=','.join(UVG_SEQUENCES))
-    parser.add_argument('--configs', default=','.join(DEFAULT_CONFIGS))
-    parser.add_argument('--max_frames', type=int, default=132)
-    parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--seed', type=int, default=1)
+    parser.add_argument('--sequences', default=None)
+    parser.add_argument('--configs', default=None)
+    parser.add_argument('--max_frames', type=int, default=None)
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--device', choices=['cpu', 'cuda', 'auto'], default='cuda')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--force', action='store_true')
@@ -60,7 +61,7 @@ def parse_args():
     parser.add_argument('--skip_fid', action='store_true')
     parser.add_argument('--rate_eval', action='store_true')
     parser.add_argument('--eval_only', action='store_true')
-    parser.add_argument('--checkpoint_policy', choices=['final', 'best'], default='final')
+    parser.add_argument('--checkpoint_policy', choices=['final', 'best'], default=None)
     parser.add_argument('--cuda_deterministic', action='store_true')
     parser.add_argument('--persist_predictions', action='store_true')
     parser.add_argument('--persist_checkpoint_interval', type=int, default=10)
@@ -239,6 +240,17 @@ def regenerate_fid_images(args, job, run_dir, config_path):
 
 def main():
     args = parse_args()
+    release_config = read_json(args.config) if args.config else {}
+    configured_sequences = release_config.get('sequences', list(UVG_SEQUENCES))
+    configured_configs = release_config.get('configs', list(DEFAULT_CONFIGS))
+    args.sequences = args.sequences or ','.join(configured_sequences)
+    args.configs = args.configs or ','.join(configured_configs)
+    args.max_frames = args.max_frames or int(release_config.get('max_frames', 132))
+    args.epochs = args.epochs or int(release_config.get('training', {}).get('epochs', 300))
+    args.seed = args.seed if args.seed is not None else int(
+        release_config.get('training', {}).get('seed', 1))
+    args.checkpoint_policy = (
+        args.checkpoint_policy or release_config.get('checkpoint_policy', 'final'))
     args.data_root = str(Path(args.data_root).resolve())
     args.output_root = str(Path(args.output_root).resolve())
     if args.persistent_root:
@@ -253,7 +265,8 @@ def main():
             'WARNING: --persistent_root was not supplied; automatic persistence is disabled.',
             file=sys.stderr,
         )
-    sequences = parse_csv_names(args.sequences, UVG_SEQUENCES, 'sequence')
+    sequences = parse_csv_names(
+        args.sequences, ('Bunny',) + UVG_SEQUENCES, 'sequence')
     configs = parse_csv_names(args.configs, DEFAULT_CONFIGS, 'configuration')
     if args.smoke_test and args.epochs > 1:
         raise ValueError('--smoke_test permits at most one epoch')
@@ -266,6 +279,17 @@ def main():
     jobs = []
     for job in base_jobs:
         job['checkpoint_policy'] = args.checkpoint_policy
+        if release_config.get('architecture'):
+            job['architecture'] = dict(release_config['architecture'])
+            job['architecture']['target_height'] = release_config['target_resolution'][0]
+            job['architecture']['target_width'] = release_config['target_resolution'][1]
+        if job['experiment'] == 'neural420_asym_y':
+            weights = release_config.get('loss_weights', {})
+            job['lambda_y'] = float(weights.get('lambda_y', job['lambda_y']))
+            job['lambda_c'] = float(weights.get('lambda_c', job['lambda_c']))
+            job['lambda_rgb'] = float(weights.get('lambda_rgb', job['lambda_rgb']))
+        if release_config.get('training'):
+            job['training'].update(release_config['training'])
         selected = discover_sequence_frames(
             args.data_root, job['sequence'], args.max_frames)
         source_resolution = inspect_frame_resolution(selected)
@@ -450,6 +474,13 @@ def main():
         return_code = run_logged(command, run_dir / 'train_log.txt')
         if return_code:
             raise RuntimeError(f"Job failed: {job['sequence']}/{job['config_name']}")
+        if args.smoke_test:
+            reload_command = build_command(
+                args, job, run_dir, config_path, evaluation_only=True)
+            print('Smoke checkpoint reload: ' + subprocess.list2cmdline(reload_command))
+            if run_logged(reload_command, run_dir / 'eval_log.txt'):
+                raise RuntimeError(
+                    f"Smoke reload evaluation failed: {job['sequence']}/{job['config_name']}")
         if persistent_run_dir:
             persist_with_retries(args, job, run_dir, persistent_run_dir)
 

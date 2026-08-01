@@ -77,7 +77,7 @@ PAPER_CONFIGS = {
 }
 
 DEFAULT_CONFIGS = tuple(PAPER_CONFIGS)
-IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg'}
+IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}
 
 
 def natural_sort_key(value):
@@ -99,6 +99,20 @@ def parse_csv_names(value, allowed, label):
 
 def discover_sequence_frames(data_root, sequence, max_frames=132):
     sequence_dir = Path(data_root) / sequence
+    if not sequence_dir.is_dir():
+        case_insensitive = next(
+            (
+                path for path in Path(data_root).iterdir()
+                if path.is_dir() and path.name.lower() == sequence.lower()
+            ),
+            None,
+        ) if Path(data_root).is_dir() else None
+        sequence_dir = case_insensitive or sequence_dir
+    if not sequence_dir.is_dir() and Path(data_root).is_dir():
+        if any(
+                path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+                for path in Path(data_root).iterdir()):
+            sequence_dir = Path(data_root)
     if not sequence_dir.is_dir():
         raise FileNotFoundError(f'UVG sequence directory not found: {sequence_dir}')
 

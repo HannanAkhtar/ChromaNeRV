@@ -2,3 +2,16 @@
 output/
 __pycache__/
 tests/__pycache__/
+dist/
+data/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.log
+.pytest_cache/
+.mypy_cache/
+.idea/
+.vscode/
+wandb/
+runs/
